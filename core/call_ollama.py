@@ -1,14 +1,28 @@
 from langchain.agents import create_agent
 
-from tools import volume_control, mute_device, pause_media, set_active_window
-
-def get_weather(city: str) -> str:
-    """Get weather for a given city."""
-    return f"It's always sunny in {city}!"
+from tools import (
+    volume_control,
+    mute_device,
+    pause_media,
+    set_active_window,
+    get_current_volume,
+    get_screen_brightness,
+    adjust_screen_brightness,
+    save_profile
+    )
 
 agent = create_agent(
     model="ollama:granite4.1:8b",
-    tools=[get_weather, volume_control, mute_device, pause_media, set_active_window],
+    tools=[
+           volume_control, 
+           mute_device, 
+           pause_media, 
+           set_active_window, 
+           get_current_volume, 
+           get_screen_brightness, 
+           adjust_screen_brightness,
+           save_profile
+           ],
     system_prompt="""You are a Windows computer control assistant.
                     You have tools to control this computer's audio.
 
@@ -19,7 +33,36 @@ agent = create_agent(
                     - Listing tools = describe them in text only""",
 )
 
-result = agent.invoke(
-    {"messages": [{"role": "user", "content": "can you make explorer the active windows"}]}
-)
-print(result["messages"][-1].content_blocks[0]['text'])
+print("Computer Control Assistant")
+print("Type 'exit' or 'quit' to stop.\n")
+
+conversation_history = []
+
+while True:
+    try:
+        user_input = input("You: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nGoodbye!")
+        break
+
+    if not user_input:
+        continue
+
+    if user_input.lower() in ("exit", "quit"):
+        print("Goodbye!")
+        break
+
+    conversation_history.append({"role": "user", "content": user_input})
+
+    result = agent.invoke({"messages": conversation_history})
+
+    assistant_message = result["messages"][-1]
+    blocks = getattr(assistant_message, "content_blocks", None)
+    response_text = blocks[0]["text"] if blocks else str(assistant_message.content)
+
+
+    response_text = assistant_message.content_blocks[0]["text"]
+
+    conversation_history.append({"role": "assistant", "content": response_text})
+
+    print(f"Assistant: {response_text}\n")
