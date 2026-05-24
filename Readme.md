@@ -10,7 +10,7 @@
 ![Open Source](https://img.shields.io/badge/Open%20Source-%E2%9D%A4-red?style=flat)
 
 ---
-![llm-desktop-agent terminal demo](assets/terminal-preview.svg)
+![llm-desktop-agent terminal demo](assets/preview.png)
 
 
 ## What is this?
@@ -66,7 +66,7 @@ Every single dependency is free and open source.
 ## Requirements
 
 - Windows 10 or 11
-- Python 3.10+
+- Python 3.12.4+
 - [Ollama](https://ollama.com/download) installed and running
 - A GPU is recommended (tested on RTX 4060 8GB) but not required
 
