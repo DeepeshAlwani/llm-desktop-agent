@@ -20,7 +20,11 @@ from tools import (
     read_profile,
     open_application,
     get_installed_apps_tool,
-    get_running_apps
+    get_running_apps,
+    query_system,
+    run_system_command,
+    show_system_monitor,
+    kill_process
 
     )
 
@@ -39,23 +43,45 @@ agent = create_agent(
            read_profile,
            open_application,
            get_installed_apps_tool,
-           get_running_apps
+           get_running_apps,
+           query_system,
+           run_system_command,
+           show_system_monitor,
+           kill_process
            ],
     system_prompt="""You are a Windows computer control assistant.
                         IMPORTANT RULES:
                         - Only call a tool when the user explicitly asks you to perform an action
                         - If the user asks what tools you have, describe them from their descriptions — do NOT call them
                         - When applying a profile: first call read_profile to get the settings, 
-                        then call volume_control, adjust_screen_brightness, and open_application 
-                        separately using the values from the profile
+                            then call volume_control, adjust_screen_brightness, and open_application 
+                            separately using the values from the profile
                         - Before opening or focusing an app, call get_running_apps first to check 
-                        if it is already open. If open use set_active_window, if not use open_application
+                            if it is already open. If open use set_active_window, if not use open_application
                         - open_application accepts a list — pass all apps at once, not one at a time
                         - Listing tools = describe them in text only
                         - Dont be scared to call mutliptle tools your task is to be accurate not fast, 
-                          take all the time you need to complete the task that means to call tools 
-                          to make sure what the user is asking has been completed
-                        - When the user says for eg: open notepad or open any application they might mean you need to run that application not just set it as active window""",
+                            take all the time you need to complete the task that means to call tools 
+                            to make sure what the user is asking has been completed
+                        - When the user says for eg: open notepad or open any application they might mean you need to run that application not just set it as active window
+                        - query_system is for information gathering — network, processes, disk, software
+                        - run_system_command is for actions — killing processes, installing apps, power commands
+                        - Always use query_system before run_system_command when you need to verify something first
+                        - For run_system_command, always confirm with the user before executing if it affects running processes or installs software
+                        - To close an app: first call get_running_apps to confirm it is running, 
+                            tell the user what you found and confirm you will close it, then call kill_process
+                        - Never refuse to kill a user application citing admin privileges — 
+                            only system processes require elevation
+                        - Apps minimized to the system tray will appear in BACKGROUND/TRAY PROCESSES 
+                            but not in VISIBLE WINDOWS — this is normal
+                        - To close a tray app use kill_process, to focus a visible window use set_active_window
+                        - If an app is not in either list, it is genuinely not running — say so clearly
+                            
+                        **CRITICAL**:
+                        - Never invent or assume information not returned by a tool
+                        - If a tool call fails or returns an error, report the exact error — do not explain why it might have failed
+                        - Never describe actions you took unless a tool was actually called and returned a result
+                        - If unsure, call the relevant tool to verify rather than reasoning from memory""",
                     
 )
 console = Console()
@@ -111,7 +137,15 @@ def render_response(response_text: str):
         pass
 
     # detect markdown table (agent sometimes outputs these)
-    if "|" in response_text and "---" in response_text:
+    has_markdown = (
+        ("|" in response_text and "---" in response_text) or
+        re.search(r"^\d+\.", response_text, re.MULTILINE) or
+        "**" in response_text or          # bold
+        re.search(r"^#{1,3} ", response_text, re.MULTILINE) or  # headers
+        re.search(r"^- ", response_text, re.MULTILINE)          # bullet lists
+    )
+
+    if has_markdown:
         console.print(Markdown(response_text))
         return
 

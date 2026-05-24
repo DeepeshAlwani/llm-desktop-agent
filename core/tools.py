@@ -1,5 +1,6 @@
 import pyautogui
 import json
+import sys
 import os
 import glob
 import subprocess
@@ -13,6 +14,121 @@ import ctypes
 import win32gui
 import win32con
 import time
+import psutil
+
+
+import subprocess
+import re
+import shlex
+
+BLOCKED_PATTERNS = [
+    r"\bdel\b", r"\brd\b", r"\brmdir\b",
+    r"\bformat\b",
+    r"\breg\s+(delete|add)\b",
+    r"\bnet\s+user\b",
+    r"\bbcdedit\b",
+    r"\bdiskpart\b",
+    r"\bsfc\b", r"\bdism\b",
+    r"\bpowershell\s+-exec\s+bypass\b",
+    r"curl.*\|\s*(bash|cmd|powershell)",
+    r"\bicacls\b", r"\bcacls\b",
+    r"\bsc\s+delete\b",
+    r"\battrib\s+.*\+s\b",  # system file attribute changes
+    r"\bmklink\b",           # symlink creation
+    r">>\s*\S+\.(bat|cmd|ps1)\b",  # writing to script files
+]
+
+REQUIRES_CONFIRMATION = [
+    r"\bshutdown\b",
+    r"\brestart\b",
+    r"\btaskkill\b",
+    r"\bwinget\s+(install|uninstall)\b",
+    r"\bnetsh\b",
+    r"\bnet\s+stop\b",
+]
+
+def _is_safe(command: str) -> tuple[bool, str]:
+    cmd_lower = command.lower().strip()
+    
+    for pattern in BLOCKED_PATTERNS:
+        if re.search(pattern, cmd_lower):
+            return False, f"Command blocked — contains restricted operation: '{pattern}'"
+    
+    return True, ""
+
+def _needs_confirmation(command: str) -> bool:
+    cmd_lower = command.lower().strip()
+    for pattern in REQUIRES_CONFIRMATION:
+        if re.search(pattern, cmd_lower):
+            return True
+    return False
+
+def _run_command(command: str, timeout: int = 15) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            # critical — don't inherit elevated privileges
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        output = result.stdout.strip()
+        error = result.stderr.strip()
+        
+        if error and not output:
+            return f"Error: {error}"
+        if output:
+            # truncate very long output so LLM context doesn't explode
+            lines = output.split('\n')
+            if len(lines) > 50:
+                output = '\n'.join(lines[:50]) + f"\n... ({len(lines)-50} more lines truncated)"
+        return output or "Command executed with no output"
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 15 seconds"
+    except Exception as e:
+        return f"Failed to run command: {e}"
+
+
+@tool("query_system", description="""Run a read-only system query command in cmd. 
+Use for checking system info, network status, running processes, installed software, 
+wifi networks, disk usage, and similar information gathering tasks. 
+Do NOT use for commands that change system state — use run_system_command instead.""")
+def query_system(command: str) -> str:
+    """
+    Runs a read-only cmd command and returns the output.
+    Args:
+        command: the cmd command to run e.g. 'ipconfig', 'tasklist', 'netstat -an'
+                 'winget list', 'systeminfo', 'ping google.com -n 4'
+    """
+    safe, reason = _is_safe(command)
+    if not safe:
+        return reason
+    
+    return _run_command(command)
+
+
+@tool("run_system_command", description="""Run a system command in cmd that changes state — 
+such as killing a process, installing software via winget, changing network settings, 
+or scheduling a shutdown. Requires user confirmation for destructive actions.
+Do NOT use for read-only queries — use query_system instead.""")
+def run_system_command(command: str, confirmed: bool = False) -> str:
+    """
+    Runs a cmd command that modifies system state.
+    Args:
+        command: the cmd command to run
+        confirmed: must be True if the user has explicitly confirmed the action.
+                   For commands requiring confirmation, ask the user first.
+    """
+    safe, reason = _is_safe(command)
+    if not safe:
+        return reason
+    
+    if _needs_confirmation(command) and not confirmed:
+        return f"This command requires confirmation: '{command}'. Please ask the user to confirm before proceeding."
+    
+    return _run_command(command)
 
 def get_screen_resolution():
     user32 = ctypes.windll.user32
@@ -389,14 +505,97 @@ def open_application(apps: list[dict]) -> str:
 
     return "\n".join(results)
 
-@tool("get_running_apps", description="""Use this tool to check which applications are 
-                                         currently open and running on the system. 
-                                         Call this before deciding whether to use open_application or set_active_window.""")
+@tool("get_running_apps", description="""Check which applications are currently open and running.
+Call this before deciding whether to use open_application, set_active_window, or kill_process.""")
 def get_running_apps() -> str:
     try:
-        # get visible windows with titles
+        # visible windows
         windows = [w.title for w in gw.getAllWindows() if w.title.strip()]
-        return f"Currently open windows: {', '.join(windows)}"
+        
+        # all running processes including tray/background apps
+        processes = []
+        seen = set()
+        for p in psutil.process_iter(['name', 'status']):
+            try:
+                name = p.info['name']
+                if name and name not in seen and p.info['status'] == 'running':
+                    seen.add(name)
+                    processes.append(name)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        return (
+            f"VISIBLE WINDOWS ({len(windows)}):\n" +
+            "\n".join(f"  - {w}" for w in windows) +
+            f"\n\nBACKGROUND/TRAY PROCESSES ({len(processes)}):\n" +
+            "\n".join(f"  - {p}" for p in sorted(processes))
+        )
     except Exception as e:
-        return f"Error getting running apps: {e}"
+        return f"Error: {e}"
     
+
+@tool("show_system_monitor", description="""Launch the interactive system resource monitor. 
+Shows real-time CPU, RAM, disk, battery and top processes in a live terminal dashboard. 
+Use when the user asks about system performance, what's using resources, battery status, 
+or wants to monitor their system.""")
+def show_system_monitor() -> str:
+    try:
+        dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.py")
+        
+        # try Windows Terminal first, fall back to cmd
+        try:
+            subprocess.Popen([
+                "wt.exe", "--title", "System Monitor",
+                sys.executable, dashboard_path
+            ])
+        except FileNotFoundError:
+            # wt not available, use cmd
+            subprocess.Popen(
+                f'start cmd /k python "{dashboard_path}"',
+                shell=True
+            )
+        return "System monitor launched"
+    except Exception as e:
+        return f"Failed to launch monitor: {e}"
+
+@tool("kill_process", description="""Kill or close a running application by name.
+Use when the user says 'close X', 'kill X', 'stop X', 'quit X'.
+Always tell the user what you are about to close and confirm before calling this tool.""")
+def kill_process(app_name: str) -> str:
+    """
+    Kills all processes matching the given app name.
+    Args:
+        app_name: name of the app e.g. 'whatsapp', 'wa', 'chrome', 'spotify'
+    """
+    search = app_name.lower().replace(" ", "").replace(".exe", "")
+    
+    # find matching processes first
+    matches = []
+    for p in psutil.process_iter(['pid', 'name']):
+        try:
+            pname = p.info['name'].lower().replace(" ", "").replace(".exe", "")
+            if search in pname or pname in search:
+                matches.append(p.info['name'])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if not matches:
+        return f"No process found matching '{app_name}'. Use get_running_apps to check what is running."
+
+    # use taskkill instead of psutil.kill() — handles AppContainer and Store apps
+    unique_names = list(set(matches))
+    results = []
+    
+    for proc_name in unique_names:
+        result = subprocess.run(
+            f'taskkill /F /IM "{proc_name}" /T',
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            results.append(f"Closed {proc_name}")
+        else:
+            results.append(f"Failed to close {proc_name}: {result.stderr.strip()}")
+
+    return "\n".join(results)

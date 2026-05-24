@@ -1,11 +1,14 @@
 # Python 3.12.4
 comtypes==1.4.16
+gputil==1.4.0
 langchain==1.3.1
 langchain-ollama
 langgraph
+psutil==7.2.2
 pyautogui==0.9.54
 pycaw==20251023
 pygetwindow==0.0.9
 pywin32==311
 rich==15.0.0
 screen_brightness_control==0.27.1
+textual==8.2.7
