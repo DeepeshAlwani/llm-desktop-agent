@@ -1,4 +1,11 @@
 from langchain.agents import create_agent
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.markdown import Markdown
+from rich.text import Text
+import json
+import re
 
 from tools import (
     volume_control,
@@ -12,7 +19,9 @@ from tools import (
     del_profile,
     read_profile,
     open_application,
-    get_installed_apps_tool
+    get_installed_apps_tool,
+    get_running_apps
+
     )
 
 agent = create_agent(
@@ -29,42 +38,125 @@ agent = create_agent(
            del_profile,
            read_profile,
            open_application,
-           get_installed_apps_tool
+           get_installed_apps_tool,
+           get_running_apps
            ],
     system_prompt="""You are a Windows computer control assistant.
-                    You have tools to control this computer.
-
-                    IMPORTANT RULES:
-                    - Only call a tool when the user explicitly asks you to perform an action
-                    - If the user asks what tools you have, describe them from their descriptions — do NOT call them
-                    - Never test or demonstrate a tool unless asked to perform that action
-                    - Listing tools = describe them in text only
-                    - Be smart about using tools you might have to call mutliple tools to complete one request from the user dont hesitate to do so""",
+                        IMPORTANT RULES:
+                        - Only call a tool when the user explicitly asks you to perform an action
+                        - If the user asks what tools you have, describe them from their descriptions — do NOT call them
+                        - When applying a profile: first call read_profile to get the settings, 
+                        then call volume_control, adjust_screen_brightness, and open_application 
+                        separately using the values from the profile
+                        - Before opening or focusing an app, call get_running_apps first to check 
+                        if it is already open. If open use set_active_window, if not use open_application
+                        - open_application accepts a list — pass all apps at once, not one at a time
+                        - Listing tools = describe them in text only
+                        - Dont be scared to call mutliptle tools your task is to be accurate not fast, 
+                          take all the time you need to complete the task that means to call tools 
+                          to make sure what the user is asking has been completed
+                        - When the user says for eg: open notepad or open any application they might mean you need to run that application not just set it as active window""",
                     
 )
+console = Console()
 
-print("Computer Control Assistant")
-print("Type 'exit' or 'quit' to stop.\n")
+def _render_dict_as_table(data: dict):
+    """Renders a dict as a two column key/value table"""
+    table = Table(show_header=True, header_style="bold cyan", box=None)
+    table.add_column("Setting", style="dim", width=20)
+    table.add_column("Value", style="white")
+
+    for key, value in data.items():
+        if isinstance(value, list):
+            value = ", ".join(str(v) if not isinstance(v, dict) 
+                            else f"{v.get('name', '')} ({v.get('url', '')})" 
+                            for v in value)
+        table.add_row(str(key), str(value))
+
+    console.print(table)
+
+
+def _render_list(data: list):
+    """Renders a list of items"""
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column("", style="cyan")
+    table.add_column("", style="white")
+
+    for i, item in enumerate(data, 1):
+        if isinstance(item, dict):
+            name = item.get("name", str(item))
+            url = item.get("url", "")
+            table.add_row(f"[{i}]", f"{name} {f'→ {url}' if url else ''}")
+        else:
+            table.add_row(f"[{i}]", str(item))
+
+    console.print(table)
+
+def render_response(response_text: str):
+    """
+    Detects what kind of content the response contains
+    and renders it appropriately with Rich
+    """
+
+    # detect json — profile contents, app lists etc
+    try:
+        data = json.loads(response_text)
+        if isinstance(data, dict):
+            _render_dict_as_table(data)
+            return
+        if isinstance(data, list):
+            _render_list(data)
+            return
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # detect markdown table (agent sometimes outputs these)
+    if "|" in response_text and "---" in response_text:
+        console.print(Markdown(response_text))
+        return
+
+    # detect tool list (numbered list from agent)
+    if re.search(r"^\d+\.", response_text, re.MULTILINE):
+        console.print(Markdown(response_text))
+        return
+
+    # default — plain panel with the response
+    console.print(Panel(
+        response_text,
+        border_style="blue",
+        padding=(0, 1)
+    ))
+
+
+console.print(Panel.fit(
+    "[bold white]LLM Desktop Agent[/bold white]\n[dim]Local AI control for Windows[/dim]",
+    border_style="blue",
+    padding=(1, 4)
+))
+console.print("[dim]Type 'exit' or 'quit' to stop.[/dim]\n")
 
 conversation_history = []
 
 while True:
     try:
-        user_input = input("You: ").strip()
+        # styled input prompt
+        user_input = console.input("[bold blue]You:[/bold blue] ").strip()
     except (EOFError, KeyboardInterrupt):
-        print("\nGoodbye!")
+        console.print("\n[dim]Goodbye![/dim]")
         break
 
     if not user_input:
         continue
 
     if user_input.lower() in ("exit", "quit"):
-        print("Goodbye!")
+        console.print("[dim]Goodbye![/dim]")
         break
 
     conversation_history.append({"role": "user", "content": user_input})
 
-    result = agent.invoke({"messages": conversation_history})
+    # show a spinner while agent is thinking
+    with console.status("[dim]thinking...[/dim]", spinner="dots"):
+        result = agent.invoke({"messages": conversation_history})
 
     assistant_message = result["messages"][-1]
     blocks = getattr(assistant_message, "content_blocks", None)
@@ -75,15 +167,18 @@ while True:
         if isinstance(assistant_message.content, str):
             response_text = assistant_message.content
         elif isinstance(assistant_message.content, list):
-            # extract text from content list
             response_text = " ".join(
-                block.get("text", "") for block in assistant_message.content 
+                block.get("text", "") for block in assistant_message.content
                 if isinstance(block, dict) and "text" in block
             )
         else:
             response_text = str(assistant_message.content)
     else:
         response_text = "Action completed."
+
     conversation_history.append({"role": "assistant", "content": response_text})
 
-    print(f"Assistant: {response_text}\n")
+    # render with Rich instead of plain print
+    console.print("[bold green]Assistant:[/bold green]")
+    render_response(response_text)
+    console.print()

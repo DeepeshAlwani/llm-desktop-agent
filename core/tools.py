@@ -9,6 +9,66 @@ import screen_brightness_control as sbc
 from pycaw.pycaw import AudioUtilities
 from comtypes import CoInitialize, CoUninitialize
 from langchain.tools import tool
+import ctypes
+import win32gui
+import win32con
+import time
+
+def get_screen_resolution():
+    user32 = ctypes.windll.user32
+    return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)  # width, height
+
+def arrange_windows(app_names: list[str]):
+    width, height = get_screen_resolution()
+    time.sleep(1.5)
+
+    handles = []
+    for name in app_names:
+        windows = gw.getWindowsWithTitle(name)
+        if windows:
+            # get the first window not already in handles
+            for w in windows:
+                if w._hWnd not in handles:
+                    handles.append(w._hWnd)
+                    break
+
+    n = len(handles)
+    if n == 0:
+        return "No windows found to arrange"
+    
+    layouts = {
+        1: [
+            (0, 0, width, height)
+        ],
+        2: [
+            (0, 0, width // 2, height),
+            (width // 2, 0, width // 2, height)
+        ],
+        3: [
+            (0, 0, int(width * 0.6), height),
+            (int(width * 0.6), 0, int(width * 0.4), height // 2),
+            (int(width * 0.6), height // 2, int(width * 0.4), height // 2)
+        ],
+        4: [
+            (0, 0, width // 2, height // 2),
+            (width // 2, 0, width // 2, height // 2),
+            (0, height // 2, width // 2, height // 2),
+            (width // 2, height // 2, width // 2, height // 2)
+        ]
+    }
+    
+    positions = layouts.get(n, layouts[4])  # fallback to grid for 4+
+    
+    for hwnd, (x, y, w, h) in zip(handles, positions):
+        # restore if minimized first
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetWindowPos(
+            hwnd, win32con.HWND_TOP,
+            x, y, w, h,
+            win32con.SWP_SHOWWINDOW
+        )
+    
+    return f"Arranged {n} windows"
 
 
 @tool("get_current_volume", description="Use this tool to get the current system volume")
@@ -87,7 +147,9 @@ def pause_media() -> str :
     
 import pygetwindow  as gw
 
-@tool("set active window", description="Use this tool to change the active window on the display")
+@tool("set active window", description="""Use this tool ONLY to bring an already running 
+                                            application to the foreground. The app must already be open and running. 
+                                            Do NOT use this to launch or start an application.""")
 def set_active_window(name_of_app: str) -> str:
     """
         Args:
@@ -121,23 +183,47 @@ def adjust_screen_brightness(brightness_value: int) -> str:
     except Exception as e:
         return f"problem changing screen brightness {e}"
     
-@tool("save_user_defined_settings", description="Use this tool to save user profile as json for future reference")
-def save_profile(volume_level: int, screen_brightness: int, application : str, profile_name: str) -> str:
+@tool("save_user_defined_settings", description="Use this tool to save a user profile as json for future reference")
+def save_profile(
+    volume_level: int,
+    screen_brightness: int,
+    apps: list[dict],
+    profile_name: str
+) -> str:
+    """
+    Save a named profile with system settings.
+    Args:
+        volume_level: volume percentage 0-100
+        screen_brightness: brightness percentage 0-100
+        apps: list of dicts with 'name' and optional 'url' keys
+              e.g. [{"name": "chrome", "url": "https://youtube.com"},
+                    {"name": "chrome", "url": "https://docs.google.com"},
+                    {"name": "notepad", "url": null}]
+        profile_name: name to save the profile under
+    """
     try:
         os.makedirs("profiles", exist_ok=True)
-        profile_dict = {"Application": application, "Screen_Brightness": screen_brightness, "volume_level": volume_level}
-        
+        profile_dict = {
+            "apps": apps,
+            "screen_brightness": screen_brightness,
+            "volume_level": volume_level
+        }
         file_path = f"profiles/{profile_name}.json"
         with open(file_path, "w") as f:
             json.dump(profile_dict, f, indent=4)
-        return f"Saved custom profile: {profile_name}"
+        app_summary = ", ".join(
+            f"{a['name']}" + (f" ({a['url']})" if a.get("url") else "")
+            for a in apps
+        )
+        return f"Saved profile '{profile_name}': {app_summary}"
     except Exception as e:
         return f"Error saving the profile: {e}"
     
 @tool("read_profile", description="use this tool to read the profile you want")
 def read_profile(profile_name: str) -> str:
+    print("here")
     try:
-        filepath = f"profiles/{profile_name}.json"
+        filepath = rf"../profiles/{profile_name}.json"
 
         with open(filepath, "r") as f:
             data = f.read()
@@ -148,7 +234,7 @@ def read_profile(profile_name: str) -> str:
 @tool("del_profile", description="use this to delete a particular profile")
 def del_profile(profile_name: str, got_confirmation: bool) -> str:
     try:
-        filepath = f"profiles/{profile_name}.json"
+        filepath = rf"../profiles/{profile_name}.json"
         if got_confirmation:
             os.remove(filepath)
         else:
@@ -226,48 +312,91 @@ def get_installed_apps_tool() -> str:
 APP_CACHE = get_installed_apps()
 
 
-def _open_app_by_name(app_name: str) -> str:
-    """
-    Opens an application on the system.
-    Args:
-        app_name: name of the app to open e.g. 'notepad', 'spotify', 'chrome'
-    """
+def _open_app_by_name(app_name: str, url: str = "") -> str:
     apps = APP_CACHE
 
     if app_name.lower() in apps:
         target = apps[app_name.lower()]
         try:
+            args = [url] if url else []
+
             if target.endswith(".lnk"):
                 exe_path = _resolve_lnk(target)
                 if exe_path and os.path.exists(exe_path):
-                    subprocess.Popen(exe_path)
+                    subprocess.Popen([exe_path] + args)
                 else:
-                    # fallback — some .lnk files point to things 
-                    # like UWP apps that have no direct exe
                     os.startfile(target)
+
             elif target.endswith(".exe"):
-                subprocess.Popen(target)
+                subprocess.Popen([target] + args)
+
             else:
-                # directory from registry — try to find an exe inside
-                os.startfile(target)
-            return f"Opened {app_name}"
+                exe_files = glob.glob(os.path.join(target, "*.exe"))
+                if exe_files:
+                    name_match = [e for e in exe_files if app_name.lower() in os.path.basename(e).lower()]
+                    chosen = name_match[0] if name_match else exe_files[0]
+                    subprocess.Popen([chosen] + args)
+                else:
+                    os.startfile(target)
+
+            return f"Opened {app_name}" + (f" with {url}" if url else "")
         except Exception as e:
             return f"Found {app_name} but failed to open it: {e}"
 
     matches = [name for name in apps.keys() if app_name.lower() in name]
     if len(matches) == 1:
-        return _open_app_by_name(matches[0])
+        return _open_app_by_name(matches[0], url)
     elif len(matches) > 1:
         return f"Multiple matches: {', '.join(matches)}. Be more specific."
     else:
         return f"No app found matching '{app_name}'. Call get_installed_apps to see what's available."
 
-
-@tool("open_application", description="Opens an installed application by name")
-def open_application(app_name: str) -> str:
+@tool("open_application", description="""Use this tool to launch applications that are 
+not currently running. Accepts a list of app objects with name and optional url. 
+If multiple apps are provided opens all and arranges them on screen automatically.
+Do NOT use this if the app is already open — use set_active_window instead.""")
+def open_application(apps: list[dict]) -> str:
     """
-    Opens an application on the system.
+    Opens one or more applications and arranges them on screen.
     Args:
-        app_name: name of the app to open e.g. 'notepad', 'spotify', 'chrome'
+        apps: list of dicts with 'name' and optional 'url'
+              e.g. [{"name": "chrome", "url": "https://youtube.com"},
+                    {"name": "chrome", "url": "https://docs.google.com"},
+                    {"name": "notepad", "url": null}]
+              for a single app: [{"name": "notepad"}]
     """
-    return _open_app_by_name(app_name)
+    if isinstance(apps, str):
+        # safety fallback if model passes a plain string
+        apps = [{"name": apps}]
+
+    results = []
+    successfully_opened = []
+
+    for app in apps:
+        name = app.get("name", "")
+        url = app.get("url") or ""
+        if not name:
+            continue
+        result = _open_app_by_name(name, url)
+        results.append(result)
+        if "Opened" in result:
+            successfully_opened.append(name)
+
+    if len(successfully_opened) > 1:
+        time.sleep(2)
+        arrangement = arrange_windows(successfully_opened)
+        results.append(arrangement)
+
+    return "\n".join(results)
+
+@tool("get_running_apps", description="""Use this tool to check which applications are 
+                                         currently open and running on the system. 
+                                         Call this before deciding whether to use open_application or set_active_window.""")
+def get_running_apps() -> str:
+    try:
+        # get visible windows with titles
+        windows = [w.title for w in gw.getAllWindows() if w.title.strip()]
+        return f"Currently open windows: {', '.join(windows)}"
+    except Exception as e:
+        return f"Error getting running apps: {e}"
+    
