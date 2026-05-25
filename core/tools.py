@@ -618,3 +618,177 @@ def kill_process(app_name: str) -> str:
             results.append(f"Failed to close {proc_name}: {result.stderr.strip()}")
 
     return "\n".join(results)
+
+
+# ---------------------------------------------------------------------------
+# Window resize / reposition presets
+# Each entry is (x_pct, y_pct, w_pct, h_pct) as fractions of screen size
+# ---------------------------------------------------------------------------
+_WINDOW_PRESETS: dict[str, tuple[float, float, float, float]] = {
+    # halves
+    "left-half":      (0.0,  0.0,  0.5,  1.0),
+    "right-half":     (0.5,  0.0,  0.5,  1.0),
+    "top-half":       (0.0,  0.0,  1.0,  0.5),
+    "bottom-half":    (0.0,  0.5,  1.0,  0.5),
+    # quarters
+    "top-left":       (0.0,  0.0,  0.5,  0.5),
+    "top-right":      (0.5,  0.0,  0.5,  0.5),
+    "bottom-left":    (0.0,  0.5,  0.5,  0.5),
+    "bottom-right":   (0.5,  0.5,  0.5,  0.5),
+    # full / centred
+    "maximized":      (0.0,  0.0,  1.0,  1.0),
+    "centered":       (0.25, 0.1,  0.5,  0.8),
+    # thirds
+    "left-third":     (0.0,         0.0, 1/3,  1.0),
+    "center-third":   (1/3,         0.0, 1/3,  1.0),
+    "right-third":    (2/3,         0.0, 1/3,  1.0),
+    # two-thirds
+    "left-two-thirds":  (0.0,       0.0, 2/3,  1.0),
+    "right-two-thirds": (1/3,       0.0, 2/3,  1.0),
+}
+
+# Aliases so the LLM can use natural phrases
+_PRESET_ALIASES: dict[str, str] = {
+    "left":           "left-half",
+    "right":          "right-half",
+    "top":            "top-half",
+    "bottom":         "bottom-half",
+    "full":           "maximized",
+    "fullscreen":     "maximized",
+    "max":            "maximized",
+    "centre":         "centered",
+    "center":         "centered",
+    "middle":         "centered",
+    "top left":       "top-left",
+    "top right":      "top-right",
+    "bottom left":    "bottom-left",
+    "bottom right":   "bottom-right",
+    "left third":     "left-third",
+    "center third":   "center-third",
+    "right third":    "right-third",
+    "left 2/3":       "left-two-thirds",
+    "right 2/3":      "right-two-thirds",
+}
+
+
+def _find_window_handle(title_fragment: str) -> tuple[int, str] | tuple[None, str]:
+    """
+    Find a visible window whose title contains title_fragment (case-insensitive).
+    Returns (hwnd, matched_title) or (None, error_message).
+    """
+    fragment = title_fragment.lower()
+    all_windows = gw.getAllWindows()
+    candidates = [w for w in all_windows if fragment in w.title.lower() and w.title.strip()]
+
+    if not candidates:
+        titles = [w.title for w in all_windows if w.title.strip()]
+        return None, (
+            f"No visible window found matching '{title_fragment}'. "
+            f"Open windows: {', '.join(titles[:20])}"
+        )
+
+    # prefer exact / shortest match
+    candidates.sort(key=lambda w: len(w.title))
+    return candidates[0]._hWnd, candidates[0].title
+
+
+@tool(
+    "resize_window",
+    description="""Move and/or resize a visible application window.
+Use when the user says things like:
+  'move chrome to the left half', 'snap notepad to the right',
+  'make spotify take up 50 percent', 'put chrome in the top-right corner',
+  'resize chrome to 60 percent width'.
+
+Parameters
+----------
+window_title : str
+    Part of the window title to identify it, e.g. 'chrome', 'notepad', 'spotify'.
+    Case-insensitive fuzzy match — you do NOT need the exact title.
+preset : str, optional
+    One of the named layout presets:
+      left-half, right-half, top-half, bottom-half,
+      top-left, top-right, bottom-left, bottom-right,
+      left-third, center-third, right-third,
+      left-two-thirds, right-two-thirds,
+      maximized, centered
+    Natural aliases also accepted: 'left', 'right', 'top', 'bottom',
+    'full', 'center', 'top left', 'bottom right', etc.
+    If preset is provided, the x/y/width/height_pct params are ignored.
+x_pct : float, optional
+    Left edge position as a fraction of screen width (0.0–1.0). Default 0.0.
+y_pct : float, optional
+    Top edge position as a fraction of screen height (0.0–1.0). Default 0.0.
+width_pct : float, optional
+    Window width as a fraction of screen width (0.0–1.0). Default 0.5.
+height_pct : float, optional
+    Window height as a fraction of screen height (0.0–1.0). Default 1.0.
+
+Examples
+--------
+  resize_window(window_title="chrome", preset="left-half")
+  resize_window(window_title="chrome", preset="right")
+  resize_window(window_title="notepad", preset="top-right")
+  resize_window(window_title="spotify", x_pct=0.1, y_pct=0.05, width_pct=0.4, height_pct=0.9)
+""",
+)
+def resize_window(
+    window_title: str,
+    preset: str = "",
+    x_pct: float = 0.0,
+    y_pct: float = 0.0,
+    width_pct: float = 0.5,
+    height_pct: float = 1.0,
+) -> str:
+    """
+    Repositions and resizes a window either by named preset or explicit percentages.
+    """
+    try:
+        # ── 1. find the window ──────────────────────────────────────────────
+        hwnd, match_info = _find_window_handle(window_title)
+        if hwnd is None:
+            return match_info  # error string
+
+        # ── 2. resolve preset → fractions ──────────────────────────────────
+        if preset:
+            key = preset.strip().lower()
+            key = _PRESET_ALIASES.get(key, key)          # normalise alias
+            if key not in _WINDOW_PRESETS:
+                available = ", ".join(sorted(_WINDOW_PRESETS.keys()))
+                return (
+                    f"Unknown preset '{preset}'. "
+                    f"Available presets: {available}. "
+                    f"Or use x_pct/y_pct/width_pct/height_pct for a custom size."
+                )
+            x_pct, y_pct, width_pct, height_pct = _WINDOW_PRESETS[key]
+
+        # ── 3. clamp fractions to [0, 1] ───────────────────────────────────
+        x_pct      = max(0.0, min(1.0, x_pct))
+        y_pct      = max(0.0, min(1.0, y_pct))
+        width_pct  = max(0.05, min(1.0, width_pct))
+        height_pct = max(0.05, min(1.0, height_pct))
+
+        # ── 4. compute pixel values ─────────────────────────────────────────
+        screen_w, screen_h = get_screen_resolution()
+        x = int(screen_w * x_pct)
+        y = int(screen_h * y_pct)
+        w = int(screen_w * width_pct)
+        h = int(screen_h * height_pct)
+
+        # ── 5. restore if minimised, then move+resize ───────────────────────
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetWindowPos(
+            hwnd,
+            win32con.HWND_TOP,
+            x, y, w, h,
+            win32con.SWP_SHOWWINDOW,
+        )
+
+        preset_label = f" (preset: {preset})" if preset else ""
+        return (
+            f"Moved '{match_info}' to ({x}, {y}), size {w}×{h} px"
+            f" — {int(width_pct*100)}% wide, {int(height_pct*100)}% tall"
+            f"{preset_label}"
+        )
+    except Exception as e:
+        return f"Failed to resize window: {e}"

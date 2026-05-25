@@ -6,6 +6,21 @@ from rich.markdown import Markdown
 from rich.text import Text
 import json
 import re
+import threading
+import queue
+
+# ── Voice input (faster-whisper) ─────────────────────────────────────────────
+# numpy and sounddevice are top-level so Pylance knows they're always bound.
+# Only faster_whisper and keyboard are truly optional — if missing, voice is
+# silently disabled but the agent continues to work normally.
+import numpy as np
+import sounddevice as sd
+
+try:
+    from faster_whisper import WhisperModel
+    VOICE_AVAILABLE = True
+except ImportError:
+    VOICE_AVAILABLE = False
 
 from tools import (
     volume_control,
@@ -25,19 +40,19 @@ from tools import (
     run_system_command,
     show_system_monitor,
     kill_process,
-    list_all_saved_profiles_names
-
-    )
+    list_all_saved_profiles_names,
+    resize_window,
+)
 
 agent = create_agent(
     model="ollama:granite4.1:8b",
     tools=[
-           volume_control, 
-           mute_device, 
-           pause_media, 
-           set_active_window, 
-           get_current_volume, 
-           get_screen_brightness, 
+           volume_control,
+           mute_device,
+           pause_media,
+           set_active_window,
+           get_current_volume,
+           get_screen_brightness,
            adjust_screen_brightness,
            save_profile,
            del_profile,
@@ -49,7 +64,8 @@ agent = create_agent(
            run_system_command,
            show_system_monitor,
            kill_process,
-           list_all_saved_profiles_names
+           list_all_saved_profiles_names,
+           resize_window,
            ],
     system_prompt="""You are a Windows computer control assistant.
                         IMPORTANT RULES:
@@ -78,38 +94,44 @@ agent = create_agent(
                             but not in VISIBLE WINDOWS — this is normal
                         - To close a tray app use kill_process, to focus a visible window use set_active_window
                         - If an app is not in either list, it is genuinely not running — say so clearly
+
+                        WINDOW RESIZING:
+                        - Use resize_window when the user says 'move X to the left/right',
+                            'snap X', 'make X take up 50%', 'put X in the corner', etc.
+                        - Prefer named presets (left-half, right-half, top-left, etc.) over raw percentages
+                        - If the user says '50% of the screen' without specifying which side, use left-half
+                        - For 'side by side' requests on two apps: use left-half for the first and right-half for the second
                             
                         **CRITICAL**:
                         - Never invent or assume information not returned by a tool
                         - If a tool call fails or returns an error, report the exact error — do not explain why it might have failed
                         - Never describe actions you took unless a tool was actually called and returned a result
                         - If unsure, call the relevant tool to verify rather than reasoning from memory""",
-                    
 )
+
 console = Console()
 
+# ── Rich rendering helpers ────────────────────────────────────────────────────
+
 def _render_dict_as_table(data: dict):
-    """Renders a dict as a two column key/value table"""
     table = Table(show_header=True, header_style="bold cyan", box=None)
     table.add_column("Setting", style="dim", width=20)
     table.add_column("Value", style="white")
-
     for key, value in data.items():
         if isinstance(value, list):
-            value = ", ".join(str(v) if not isinstance(v, dict) 
-                            else f"{v.get('name', '')} ({v.get('url', '')})" 
-                            for v in value)
+            value = ", ".join(
+                str(v) if not isinstance(v, dict)
+                else f"{v.get('name', '')} ({v.get('url', '')})"
+                for v in value
+            )
         table.add_row(str(key), str(value))
-
     console.print(table)
 
 
 def _render_list(data: list):
-    """Renders a list of items"""
     table = Table(show_header=False, box=None, padding=(0, 1))
     table.add_column("", style="cyan")
     table.add_column("", style="white")
-
     for i, item in enumerate(data, 1):
         if isinstance(item, dict):
             name = item.get("name", str(item))
@@ -117,16 +139,10 @@ def _render_list(data: list):
             table.add_row(f"[{i}]", f"{name} {f'→ {url}' if url else ''}")
         else:
             table.add_row(f"[{i}]", str(item))
-
     console.print(table)
 
-def render_response(response_text: str):
-    """
-    Detects what kind of content the response contains
-    and renders it appropriately with Rich
-    """
 
-    # detect json — profile contents, app lists etc
+def render_response(response_text: str):
     try:
         data = json.loads(response_text)
         if isinstance(data, dict):
@@ -138,46 +154,160 @@ def render_response(response_text: str):
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # detect markdown table (agent sometimes outputs these)
     has_markdown = (
-        ("|" in response_text and "---" in response_text) or
-        re.search(r"^\d+\.", response_text, re.MULTILINE) or
-        "**" in response_text or          # bold
-        re.search(r"^#{1,3} ", response_text, re.MULTILINE) or  # headers
-        re.search(r"^- ", response_text, re.MULTILINE)          # bullet lists
+        ("|" in response_text and "---" in response_text)
+        or re.search(r"^\d+\.", response_text, re.MULTILINE)
+        or "**" in response_text
+        or re.search(r"^#{1,3} ", response_text, re.MULTILINE)
+        or re.search(r"^- ", response_text, re.MULTILINE)
     )
-
     if has_markdown:
         console.print(Markdown(response_text))
         return
 
-    # detect tool list (numbered list from agent)
-    if re.search(r"^\d+\.", response_text, re.MULTILINE):
-        console.print(Markdown(response_text))
+    console.print(Panel(response_text, border_style="blue", padding=(0, 1)))
+
+
+# ── Voice input ───────────────────────────────────────────────────────────────
+#
+#   Press and HOLD V (or the configured hotkey) to record.
+#   Release to transcribe and inject as typed input.
+#   Requires:  pip install sounddevice numpy faster-whisper keyboard
+#
+# We use a shared queue so the voice thread can hand transcripts
+# back to the main input loop without blocking it.
+
+VOICE_HOTKEY = "shift + v"          # change to e.g. "space" if you prefer
+SAMPLE_RATE  = 16000        # Whisper expects 16 kHz
+WHISPER_MODEL_SIZE = "base" # tiny / base / small — base is the best CPU/accuracy balance
+
+# Single queue that both voice and keyboard threads feed into.
+# The main loop just blocks on input_queue.get() — no more racing.
+input_queue: queue.Queue[str] = queue.Queue()
+_whisper_model = None        # loaded lazily on first use
+
+
+def _load_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        console.print("[dim]Loading Whisper model (first-time only)…[/dim]")
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL_SIZE,
+            device="cpu",
+            compute_type="int8",   # fastest on CPU, negligible accuracy loss
+        )
+    return _whisper_model
+
+
+def _record_while_held(hotkey: str) -> np.ndarray:
+    """
+    Records audio into a buffer for as long as the hotkey is held.
+    Returns a float32 numpy array at SAMPLE_RATE.
+    Requires the `keyboard` package.
+    """
+    import keyboard  # imported here so missing package only breaks voice, not the agent
+    frames = []
+
+    def _callback(indata, frame_count, time_info, status):
+        frames.append(indata.copy())
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                        dtype="float32", callback=_callback):
+        while keyboard.is_pressed(hotkey):
+            sd.sleep(50)  # poll every 50 ms
+
+    if not frames:
+        return np.array([], dtype="float32")
+    return np.concatenate(frames, axis=0).flatten()
+
+
+def _voice_thread():
+    """
+    Runs in a background daemon thread.
+    Waits for the hotkey press, records, transcribes, and pushes the
+    transcript string into voice_queue for the main loop to consume.
+    """
+    try:
+        import keyboard
+    except ImportError:
+        console.print(
+            "[yellow]Voice input disabled — install the 'keyboard' package to enable it.[/yellow]"
+        )
         return
 
-    # default — plain panel with the response
-    console.print(Panel(
-        response_text,
-        border_style="blue",
-        padding=(0, 1)
-    ))
+    console.print(
+        f"[dim]🎤 Voice ready — hold [bold]{VOICE_HOTKEY.upper()}[/bold] to speak.[/dim]\n"
+    )
 
+    while True:
+        # block until the hotkey is pressed (edge trigger)
+        keyboard.wait(VOICE_HOTKEY)
+
+        console.print("[bold yellow]🎤 Recording…[/bold yellow]", end="\r")
+        audio = _record_while_held(VOICE_HOTKEY)
+
+        if audio.size < SAMPLE_RATE * 0.3:
+            # less than 0.3 s — probably accidental press
+            console.print(" " * 30, end="\r")
+            continue
+
+        with console.status("[dim]Transcribing…[/dim]", spinner="dots"):
+            try:
+                model = _load_whisper()
+                segments, _ = model.transcribe(audio, language="en", beam_size=1)
+                transcript = " ".join(s.text.strip() for s in segments).strip()
+            except Exception as exc:
+                console.print(f"[red]Transcription error: {exc}[/red]")
+                continue
+
+        if transcript:
+            console.print(f"[bold magenta]🎤 You (voice):[/bold magenta] {transcript}")
+            input_queue.put(transcript)
+        else:
+            console.print("[dim]Nothing heard.[/dim]")
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
 
 console.print(Panel.fit(
     "[bold white]LLM Desktop Agent[/bold white]\n[dim]Local AI control for Windows[/dim]",
     border_style="blue",
-    padding=(1, 4)
+    padding=(1, 4),
 ))
-console.print("[dim]Type 'exit' or 'quit' to stop.[/dim]\n")
+
+if VOICE_AVAILABLE:
+    console.print(
+        f"[dim]Type your command or hold [bold]{VOICE_HOTKEY.upper()}[/bold] to speak. "
+        f"Type 'exit' or 'quit' to stop.[/dim]\n"
+    )
+    t = threading.Thread(target=_voice_thread, daemon=True)
+    t.start()
+else:
+    console.print(
+        "[dim]Type 'exit' or 'quit' to stop. "
+        "(Voice unavailable — install sounddevice, faster-whisper, keyboard)[/dim]\n"
+    )
 
 conversation_history = []
 
+def _keyboard_thread():
+    """Reads typed input in a background thread and feeds it into input_queue."""
+    while True:
+        try:
+            text = console.input("[bold blue]You:[/bold blue] ").strip()
+            input_queue.put(text)
+        except (EOFError, KeyboardInterrupt):
+            input_queue.put("__EXIT__")
+            break
+
+keyboard_thread = threading.Thread(target=_keyboard_thread, daemon=True)
+keyboard_thread.start()
+
 while True:
-    try:
-        # styled input prompt
-        user_input = console.input("[bold blue]You:[/bold blue] ").strip()
-    except (EOFError, KeyboardInterrupt):
+    # Both voice and keyboard feed input_queue — no blocking race condition.
+    user_input = input_queue.get()
+
+    if user_input == "__EXIT__":
         console.print("\n[dim]Goodbye![/dim]")
         break
 
@@ -190,7 +320,6 @@ while True:
 
     conversation_history.append({"role": "user", "content": user_input})
 
-    # show a spinner while agent is thinking
     with console.status("[dim]thinking...[/dim]", spinner="dots"):
         result = agent.invoke({"messages": conversation_history})
 
@@ -214,7 +343,6 @@ while True:
 
     conversation_history.append({"role": "assistant", "content": response_text})
 
-    # render with Rich instead of plain print
     console.print("[bold green]Assistant:[/bold green]")
     render_response(response_text)
     console.print()
