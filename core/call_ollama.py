@@ -9,10 +9,10 @@ import re
 import threading
 import queue
 
-# ── Voice input (faster-whisper) ─────────────────────────────────────────────
+# ── Voice input (faster-whisper, always-on wake word) ────────────────────────
 # numpy and sounddevice are top-level so Pylance knows they're always bound.
-# Only faster_whisper and keyboard are truly optional — if missing, voice is
-# silently disabled but the agent continues to work normally.
+# faster_whisper is optional — if missing, voice is silently disabled but the
+# agent continues to work normally via typed input.
 import numpy as np
 import sounddevice as sd
 
@@ -168,103 +168,212 @@ def render_response(response_text: str):
     console.print(Panel(response_text, border_style="blue", padding=(0, 1)))
 
 
-# ── Voice input ───────────────────────────────────────────────────────────────
+# ── Wake-word voice config ────────────────────────────────────────────────────
 #
-#   Press and HOLD V (or the configured hotkey) to record.
-#   Release to transcribe and inject as typed input.
-#   Requires:  pip install sounddevice numpy faster-whisper keyboard
+#   The microphone runs continuously.  A lightweight "tiny" Whisper model
+#   checks each short chunk for the WAKE_PHRASE.  When heard, a heavier
+#   "base" model transcribes the full command and sends it to the agent.
 #
-# We use a shared queue so the voice thread can hand transcripts
-# back to the main input loop without blocking it.
+#   No keyboard package needed — the keyboard hotkey has been removed.
+#   Requires:  pip install sounddevice numpy faster-whisper
 
-VOICE_HOTKEY = "shift + v"          # change to e.g. "space" if you prefer
-SAMPLE_RATE  = 16000        # Whisper expects 16 kHz
-WHISPER_MODEL_SIZE = "base" # tiny / base / small — base is the best CPU/accuracy balance
+SAMPLE_RATE        = 16000          # Whisper expects 16 kHz
+WAKE_PHRASE        = "hello"    # ← change to whatever wake word you like
+WAKE_MODEL_SIZE    = "tiny"         # always-on model — fast and light on CPU
+COMMAND_MODEL_SIZE = "base"         # command model — better accuracy
+
+# Tuning
+WAKE_CHUNK_SEC        = 2.0         # seconds per wake-detection chunk (longer = more context for Whisper)
+SILENCE_THRESHOLD     = 0.005       # RMS below this = silence (lowered — was filtering too aggressively)
+SILENCE_TIMEOUT       = 1.8         # seconds of silence to end a command
+MAX_COMMAND_SEC       = 15          # hard cap on command length
+
+# Set to True to print what Whisper hears on every chunk — helps diagnose wake-word issues.
+# Turn off once working reliably.
+VOICE_DEBUG = True
 
 # Single queue that both voice and keyboard threads feed into.
-# The main loop just blocks on input_queue.get() — no more racing.
 input_queue: queue.Queue[str] = queue.Queue()
-_whisper_model = None        # loaded lazily on first use
+
+_wake_model:    "WhisperModel | None" = None
+_command_model: "WhisperModel | None" = None
 
 
-def _load_whisper():
-    global _whisper_model
-    if _whisper_model is None:
-        console.print("[dim]Loading Whisper model (first-time only)…[/dim]")
-        _whisper_model = WhisperModel(
-            WHISPER_MODEL_SIZE,
-            device="cpu",
-            compute_type="int8",   # fastest on CPU, negligible accuracy loss
-        )
-    return _whisper_model
+def _load_wake_model() -> "WhisperModel":
+    global _wake_model
+    if _wake_model is None:
+        console.print(f"[dim]Loading wake-word model ({WAKE_MODEL_SIZE})…[/dim]")
+        _wake_model = WhisperModel(WAKE_MODEL_SIZE, device="cpu", compute_type="int8")
+    return _wake_model
 
 
-def _record_while_held(hotkey: str) -> np.ndarray:
+def _load_command_model() -> "WhisperModel":
+    global _command_model
+    if _command_model is None:
+        console.print(f"[dim]Loading command model ({COMMAND_MODEL_SIZE})…[/dim]")
+        _command_model = WhisperModel(COMMAND_MODEL_SIZE, device="cpu", compute_type="int8")
+    return _command_model
+
+
+def _rms(audio: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(audio ** 2)))
+
+
+def _record_chunk(seconds: float) -> np.ndarray:
+    """Synchronously record `seconds` of audio and return a float32 array."""
+    frames = int(SAMPLE_RATE * seconds)
+    recording = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1,
+                       dtype="float32", blocking=True)
+    return recording.flatten()
+
+
+def _record_until_silence() -> np.ndarray:
     """
-    Records audio into a buffer for as long as the hotkey is held.
-    Returns a float32 numpy array at SAMPLE_RATE.
-    Requires the `keyboard` package.
+    Records short bursts until SILENCE_TIMEOUT seconds of consecutive
+    silence or MAX_COMMAND_SEC total.  Returns the full concatenated audio.
     """
-    import keyboard  # imported here so missing package only breaks voice, not the agent
-    frames = []
+    chunk_sec    = 5
+    chunk_frames = int(SAMPLE_RATE * chunk_sec)
+    silence_needed = int(SILENCE_TIMEOUT / chunk_sec)
 
-    def _callback(indata, frame_count, time_info, status):
-        frames.append(indata.copy())
+    buffers:       list[np.ndarray] = []
+    silent_chunks: int = 0
+    total_sec:     float = 0.0
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                        dtype="float32", callback=_callback):
-        while keyboard.is_pressed(hotkey):
-            sd.sleep(50)  # poll every 50 ms
+    while total_sec < MAX_COMMAND_SEC:
+        chunk = sd.rec(chunk_frames, samplerate=SAMPLE_RATE,
+                       channels=1, dtype="float32", blocking=True).flatten()
+        buffers.append(chunk)
+        total_sec += chunk_sec
 
-    if not frames:
-        return np.array([], dtype="float32")
-    return np.concatenate(frames, axis=0).flatten()
+        if _rms(chunk) < SILENCE_THRESHOLD:
+            silent_chunks += 1
+            if silent_chunks >= silence_needed:
+                break
+        else:
+            silent_chunks = 0
+
+    return np.concatenate(buffers) if buffers else np.array([], dtype="float32")
+
+
+def _transcribe(model: "WhisperModel", audio: np.ndarray) -> str:
+    segments, _ = model.transcribe(audio, language="en", beam_size=1)
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+def _wake_detected(text: str) -> bool:
+    """
+    Fuzzy wake-word check.  Handles Whisper quirks like:
+      - "hey, agent" / "Hey Agent" / "hey Agent!"
+      - "hey aged" / "hey aiden"  (common mishearings)
+      - The wake phrase split across punctuation
+    Strategy: strip punctuation, check for all wake-phrase words in order.
+    """
+    import re
+    cleaned = re.sub(r"[^\w\s]", "", text.lower())   # remove punctuation
+    words   = cleaned.split()
+
+    wake_words = WAKE_PHRASE.lower().split()          # e.g. ["hey", "agent"]
+    # Look for the first wake word, then check each following word fuzzy-matches
+    for i, word in enumerate(words):
+        if _similar(word, wake_words[0]):
+            # Check remaining wake words follow consecutively
+            if all(
+                i + j < len(words) and _similar(words[i + j], wake_words[j])
+                for j in range(1, len(wake_words))
+            ):
+                return True
+    return False
+
+
+def _similar(a: str, b: str) -> bool:
+    """True if two words are close enough (exact or share 80 %+ of chars)."""
+    if a == b:
+        return True
+    # Simple character-overlap ratio (no extra deps needed)
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    matches = sum(c in longer for c in shorter)
+    return matches / max(len(longer), 1) >= 0.75
+
+
+def _strip_wake(text: str) -> str:
+    """Remove wake phrase prefix from transcript if present."""
+    import re
+    # Try exact first
+    lower = text.lower()
+    idx = lower.find(WAKE_PHRASE.lower())
+    if idx != -1:
+        return text[idx + len(WAKE_PHRASE):].strip(" ,.")
+    # Fuzzy: drop everything up to and including the last wake-phrase word
+    cleaned_words = re.sub(r"[^\w\s]", "", lower).split()
+    wake_words    = WAKE_PHRASE.lower().split()
+    orig_words    = text.split()
+    for i in range(len(cleaned_words) - len(wake_words) + 1):
+        if all(_similar(cleaned_words[i + j], wake_words[j]) for j in range(len(wake_words))):
+            return " ".join(orig_words[i + len(wake_words):]).strip()
+    return text
 
 
 def _voice_thread():
     """
-    Runs in a background daemon thread.
-    Waits for the hotkey press, records, transcribes, and pushes the
-    transcript string into voice_queue for the main loop to consume.
+    Always-on wake-word listener.
+
+    1. Record a short chunk (WAKE_CHUNK_SEC).
+    2. Transcribe with the tiny model — skip if silent.
+    3. Wake phrase found → record full command → transcribe with base model
+       → push transcript to input_queue.
     """
     try:
-        import keyboard
-    except ImportError:
-        console.print(
-            "[yellow]Voice input disabled — install the 'keyboard' package to enable it.[/yellow]"
-        )
+        _load_wake_model()
+    except Exception as exc:
+        console.print(f"[red]Could not load Whisper: {exc}[/red]")
         return
 
     console.print(
-        f"[dim]🎤 Voice ready — hold [bold]{VOICE_HOTKEY.upper()}[/bold] to speak.[/dim]\n"
+        f'[dim]🎤 Always-on voice ready — say [bold]"{WAKE_PHRASE}"[/bold] to give a command.[/dim]\n'
     )
 
     while True:
-        # block until the hotkey is pressed (edge trigger)
-        keyboard.wait(VOICE_HOTKEY)
+        try:
+            # ── listen for wake phrase ────────────────────────────────────────
+            chunk = _record_chunk(WAKE_CHUNK_SEC)
 
-        console.print("[bold yellow]🎤 Recording…[/bold yellow]", end="\r")
-        audio = _record_while_held(VOICE_HOTKEY)
-
-        if audio.size < SAMPLE_RATE * 0.3:
-            # less than 0.3 s — probably accidental press
-            console.print(" " * 30, end="\r")
-            continue
-
-        with console.status("[dim]Transcribing…[/dim]", spinner="dots"):
-            try:
-                model = _load_whisper()
-                segments, _ = model.transcribe(audio, language="en", beam_size=1)
-                transcript = " ".join(s.text.strip() for s in segments).strip()
-            except Exception as exc:
-                console.print(f"[red]Transcription error: {exc}[/red]")
+            # Skip silent chunks to avoid wasting CPU on transcription
+            if _rms(chunk) < SILENCE_THRESHOLD * 0.5:
                 continue
 
-        if transcript:
-            console.print(f"[bold magenta]🎤 You (voice):[/bold magenta] {transcript}")
-            input_queue.put(transcript)
-        else:
-            console.print("[dim]Nothing heard.[/dim]")
+            wake_text = _transcribe(_load_wake_model(), chunk)
+            if not wake_text or not _wake_detected(wake_text):
+                continue
+
+            # ── wake phrase heard — capture command ───────────────────────────
+            console.print("[bold yellow]🎤 Listening…[/bold yellow]", end="\r")
+            _load_command_model()   # pre-load while user formulates command
+
+            inline = _strip_wake(wake_text)
+            if inline:
+                # Full command was in the same chunk as the wake phrase
+                command_text = inline
+            else:
+                # Command follows in the next audio burst
+                command_audio = _record_until_silence()
+                if command_audio.size < SAMPLE_RATE * 0.3:
+                    console.print(" " * 50, end="\r")
+                    continue
+                with console.status("[dim]Transcribing…[/dim]", spinner="dots"):
+                    command_text = _transcribe(_load_command_model(), command_audio)
+
+            command_text = command_text.strip()
+            if not command_text:
+                console.print("[dim]Nothing heard after wake word.[/dim]")
+                continue
+
+            console.print(f"[bold magenta]🎤 You (voice):[/bold magenta] {command_text}")
+            input_queue.put(command_text)
+
+        except Exception as exc:
+            console.print(f"[red]Voice error: {exc}[/red]")
+            sd.sleep(500)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -277,7 +386,7 @@ console.print(Panel.fit(
 
 if VOICE_AVAILABLE:
     console.print(
-        f"[dim]Type your command or hold [bold]{VOICE_HOTKEY.upper()}[/bold] to speak. "
+        f'[dim]Type a command or say [bold]"{WAKE_PHRASE}"[/bold] to speak. '
         f"Type 'exit' or 'quit' to stop.[/dim]\n"
     )
     t = threading.Thread(target=_voice_thread, daemon=True)
@@ -285,7 +394,7 @@ if VOICE_AVAILABLE:
 else:
     console.print(
         "[dim]Type 'exit' or 'quit' to stop. "
-        "(Voice unavailable — install sounddevice, faster-whisper, keyboard)[/dim]\n"
+        "(Voice unavailable — install sounddevice and faster-whisper)[/dim]\n"
     )
 
 conversation_history = []
