@@ -24,7 +24,8 @@ from tools import (
     query_system,
     run_system_command,
     show_system_monitor,
-    kill_process
+    kill_process,
+    list_all_saved_profiles_names
 
     )
 
@@ -47,7 +48,8 @@ agent = create_agent(
            query_system,
            run_system_command,
            show_system_monitor,
-           kill_process
+           kill_process,
+           list_all_saved_profiles_names
            ],
     system_prompt="""You are a Windows computer control assistant.
                         IMPORTANT RULES:

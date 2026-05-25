@@ -299,6 +299,18 @@ def adjust_screen_brightness(brightness_value: int) -> str:
     except Exception as e:
         return f"problem changing screen brightness {e}"
     
+@tool("list_all_saved_profile_names", description="Use this tool to fetch the name of all the custom profiles saved")
+def list_all_saved_profiles_names() -> list:
+    try: 
+        folder_path = r"../profiles"
+        if os.path.exists(folder_path):
+            file_list = os.listdir(folder_path)
+        else:
+            return ["Error no profiles folder exists"]
+        return file_list
+    except Exception as e:
+        return [f'Error in fetching the list {e}']
+    
 @tool("save_user_defined_settings", description="Use this tool to save a user profile as json for future reference")
 def save_profile(
     volume_level: int,
@@ -311,14 +323,16 @@ def save_profile(
     Args:
         volume_level: volume percentage 0-100
         screen_brightness: brightness percentage 0-100
-        apps: list of dicts with 'name' and optional 'url' keys
+        apps: list of dicts — MUST include 'url' key for any browser app opening a website
+        Example with URLs:
               e.g. [{"name": "chrome", "url": "https://youtube.com"},
                     {"name": "chrome", "url": "https://docs.google.com"},
                     {"name": "notepad", "url": null}]
         profile_name: name to save the profile under
+        Never omit the 'url' key — use null if no URL is needed
     """
     try:
-        os.makedirs("profiles", exist_ok=True)
+        os.makedirs(r"../profiles", exist_ok=True)
         profile_dict = {
             "apps": apps,
             "screen_brightness": screen_brightness,
@@ -337,6 +351,11 @@ def save_profile(
     
 @tool("read_profile", description="use this tool to read the profile you want")
 def read_profile(profile_name: str) -> str:
+    """
+    NOTE: DO NOT ADD FILE EXTENSION TO THE PROFILENAME JUST PROVIDE THE FILE NAME 
+        FOR EXAMPLE:
+        gaming is correct, gaming.json is incorrect
+    """
     print("here")
     try:
         filepath = rf"../profiles/{profile_name}.json"
@@ -439,19 +458,19 @@ def _open_app_by_name(app_name: str, url: str = "") -> str:
             if target.endswith(".lnk"):
                 exe_path = _resolve_lnk(target)
                 if exe_path and os.path.exists(exe_path):
-                    subprocess.Popen([exe_path] + args)
+                    subprocess.Popen([exe_path] + args, creationflags=subprocess.CREATE_NEW_CONSOLE)
                 else:
                     os.startfile(target)
 
             elif target.endswith(".exe"):
-                subprocess.Popen([target] + args)
+                subprocess.Popen([target] + args, creationflags=subprocess.CREATE_NEW_CONSOLE)
 
             else:
                 exe_files = glob.glob(os.path.join(target, "*.exe"))
                 if exe_files:
                     name_match = [e for e in exe_files if app_name.lower() in os.path.basename(e).lower()]
                     chosen = name_match[0] if name_match else exe_files[0]
-                    subprocess.Popen([chosen] + args)
+                    subprocess.Popen([chosen] + args, creationflags=subprocess.CREATE_NEW_CONSOLE)
                 else:
                     os.startfile(target)
 
