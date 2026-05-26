@@ -33,6 +33,9 @@ Assistant: Found WhatsApp running in background. Closing it now... Done.
 
 You: open chrome with youtube and google docs side by side
 Assistant: Opened chrome (youtube.com) and chrome (docs.google.com). Arranged side by side.
+
+You: move chrome to the left half and snap notepad to the right
+Assistant: Moved Chrome to left-half. Moved Notepad to right-half.
 ```
 
 ---
@@ -40,31 +43,52 @@ Assistant: Opened chrome (youtube.com) and chrome (docs.google.com). Arranged si
 ## Features
 
 ### System Control
-- **Volume** — get and set system volume, mute/unmute with auto-unmute on volume change
+- **Volume** — get and set system volume, mute/unmute with auto-unmute on volume change (setting volume while muted automatically unmutes)
 - **Screen brightness** — read and adjust display brightness
 - **Media control** — play/pause media globally across any app via virtual media keys
-- **App launcher** — open any installed application by name with fuzzy matching, supports URLs for browser apps
-- **Multi-app launch** — open multiple apps at once with automatic window arrangement (side by side, grid, etc.)
-- **Window management** — bring any running app to the foreground
-- **Process management** — close any running application including system tray apps, with process name fuzzy matching
+- **App launcher** — open any installed application by name with fuzzy matching; sources Start Menu shortcuts, registry, and Windows built-ins (notepad, calc, mspaint, etc.), supports URLs for browser apps
+- **Multi-app launch** — open multiple apps at once with automatic window arrangement: 1-app fullscreen, 2-app side-by-side, 3-app main+stack, 4-app grid
+- **Window management** — bring any running app to the foreground; distinguishes visible windows from tray/background processes
+- **Window resize & reposition** — move and resize any window by name using named presets or exact percentages (see below)
+- **Process management** — close any running application including system tray apps, with fuzzy process name matching; uses `taskkill /T` to terminate full process trees including Store/AppContainer apps
+
+### Window Layout Presets
+
+Say things like _"move chrome to the left half"_, _"snap notepad to the top right"_, _"put spotify in the center third"_ — the agent maps natural language to one of 15 named presets:
+
+| Preset | Description |
+|---|---|
+| `left-half` / `right-half` | Fill left or right 50% |
+| `top-half` / `bottom-half` | Fill top or bottom 50% |
+| `top-left` / `top-right` / `bottom-left` / `bottom-right` | Quarter-screen corners |
+| `left-third` / `center-third` / `right-third` | Horizontal thirds |
+| `left-two-thirds` / `right-two-thirds` | Two-thirds layouts |
+| `maximized` | Full screen |
+| `centered` | Floating centered (50% wide, 80% tall) |
+
+Custom pixel-exact placement is also supported via x/y/width/height percentages.
 
 ### Intelligence
-- **Profile system** — save and load named configurations with multiple apps, URLs, volume and brightness (e.g. "study", "gaming", "focus")
+- **Profile system** — save and load named configurations with multiple apps, optional URLs per app, volume and brightness (e.g. "study", "gaming", "focus")
 - **Multi-step reasoning** — one request chains multiple tools automatically
-- **System awareness** — checks if apps are already running before opening, detects tray vs visible windows
-- **CMD access** — controlled read/write access to Windows command line for network queries, process info, software management via `winget`, and more
+- **System awareness** — checks if apps are already running before opening, detects tray vs visible windows, verifies actions with follow-up tool calls
+- **CMD access** — controlled read/write access to Windows command line split into two tools: read-only queries (`query_system`) and state-changing commands (`run_system_command`) with mandatory user confirmation
+- **Command safety layer** — blocklist of destructive operations (`del`, `format`, `reg delete`, `diskpart`, symlink creation, script file writes, etc.) refused regardless of how they're requested; separate confirmation gate for shutdown, restart, `winget install/uninstall`, and network changes
 - **Persistent conversation** — remembers context within a session
 
 ### Monitoring
 - **Live system dashboard** — real-time terminal UI showing CPU, RAM, GPU, GPU VRAM, disk read/write MB/s, battery status and time remaining
-- **Process table** — top 30 processes sorted by CPU with colour-coded usage
-- **Sparkline history** — rolling graphs for each metric
+- **Process table** — top 30 processes sorted by CPU with colour-coded usage (red >50%, yellow >20%)
+- **Sparkline history** — rolling 40-sample graphs for each metric updating every 2 seconds
 - **System info queries** — ask in natural language about network, disk, installed software, running processes
 
 ### Interface
+- **Voice input** — hold `Shift+V` to speak, release to send; transcribed entirely locally via faster-whisper (base model, CPU, int8 quantized); no audio ever leaves the machine; Whisper model loads lazily on first use so startup is instant
+- **Unified input queue** — voice and keyboard both feed the same queue so transcripts are dispatched immediately without pressing Enter
 - **Rich terminal output** — markdown rendering, tables, panels, syntax highlighting
 - **Thinking spinner** — visual feedback while agent is processing
-- **Smart rendering** — auto-detects JSON, markdown tables, lists and renders each appropriately
+- **Smart rendering** — auto-detects JSON, markdown tables, bullet lists and renders each appropriately
+- **Graceful degradation** — voice dependencies (faster-whisper, sounddevice, keyboard) are optional; agent runs normally in text-only mode if they are not installed
 - **100% local** — nothing leaves your machine
 
 ---
@@ -83,8 +107,11 @@ Assistant: Opened chrome (youtube.com) and chrome (docs.google.com). Arranged si
 | [screen-brightness-control](https://github.com/Crozzers/screen-brightness-control) | Display brightness management |
 | [pyautogui](https://pyautogui.readthedocs.io) | Global media key simulation |
 | [pygetwindow](https://github.com/asweigart/PyGetWindow) | Window focus and management |
-| [pywin32](https://github.com/mhammond/pywin32) | Windows API access and `.lnk` shortcut resolution |
+| [pywin32](https://github.com/mhammond/pywin32) | Windows API access, `.lnk` shortcut resolution, low-level window positioning |
 | [comtypes](https://github.com/enthought/comtypes) | COM interface bindings for audio |
+| [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | Local speech-to-text transcription (optional) |
+| [sounddevice](https://python-sounddevice.readthedocs.io) | Microphone audio capture (optional) |
+| [keyboard](https://github.com/boppreh/keyboard) | Global hotkey detection for push-to-talk (optional) |
 
 Every single dependency is free and open source.
 
@@ -123,10 +150,13 @@ agent_env\Scripts\activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Pull a model via Ollama
+# 4. (Optional) Install voice input dependencies
+pip install faster-whisper sounddevice keyboard numpy
+
+# 5. Pull a model via Ollama
 ollama pull granite4.1:8b
 
-# 5. Run the agent
+# 6. Run the agent
 cd core
 python call_ollama.py
 ```
@@ -135,13 +165,25 @@ python call_ollama.py
 
 ---
 
+## Voice Input
+
+Hold `Shift+V` to record, release to send. The transcript is injected directly into the agent — no Enter key needed.
+
+- Runs entirely on CPU using faster-whisper's `base` model with int8 quantization
+- The Whisper model downloads and loads on first use (~150MB, cached afterwards)
+- Change the hotkey by editing `VOICE_HOTKEY` at the top of `call_ollama.py`
+- Change the model size (`tiny` / `base` / `small`) by editing `WHISPER_MODEL_SIZE` — `base` is the recommended balance of speed and accuracy for commands
+- Voice is optional — if the packages aren't installed the agent runs in text-only mode with no errors
+
+---
+
 ## Project Structure
 
 ```
 llm-desktop-agent/
 ├── core/
-│   ├── call_ollama.py      # Agent loop, conversation management, Rich rendering
-│   ├── tools.py            # All LangChain tools
+│   ├── call_ollama.py      # Agent loop, conversation management, Rich rendering, voice input
+│   ├── tools.py            # All LangChain tools (19 tools)
 │   └── dashboard.py        # Textual live system monitor (launched separately)
 ├── profiles/               # Saved user profiles — auto-created on first save
 ├── assets/
@@ -157,15 +199,18 @@ The agent logic, tool definitions, and interface are kept intentionally separate
 ## How It Works
 
 ```
-User input (terminal)
+User input (typed or voice)
+        ↓
+   Unified input queue
+   (keyboard thread + voice thread)
         ↓
    LangChain Agent
-   + 18 tool definitions
+   + 19 tool definitions
         ↓
    LLM decides which tool(s) to call and in what order
         ↓
    Python dispatcher executes:
-   pycaw / pyautogui / subprocess / sbc / psutil / win32api
+   pycaw / pyautogui / subprocess / sbc / psutil / win32api / win32gui
         ↓
    Tool result returned to LLM
         ↓
@@ -211,7 +256,7 @@ The agent has controlled access to the Windows command line split into two tools
 - **`query_system`** — read-only queries: `ipconfig`, `tasklist`, `netstat`, `systeminfo`, `winget list`, `ping` etc.
 - **`run_system_command`** — state-changing actions: `taskkill`, `winget install`, `netsh`, power commands — always with user confirmation
 
-Destructive commands (`del`, `format`, `reg delete`, `diskpart` etc.) are blocked regardless of how they are requested.
+Destructive commands (`del`, `format`, `reg delete`, `diskpart`, symlink creation, script file writes, etc.) are blocked regardless of how they are requested.
 
 ---
 
@@ -229,9 +274,9 @@ python dashboard.py
 | RAM % | Memory usage with sparkline history |
 | GPU % | NVIDIA GPU load (requires GPUtil) |
 | GPU RAM % | VRAM usage percentage |
-| Disk Read/Write | Real MB/s delta (not cumulative) |
+| Disk Read/Write | Real MB/s delta (not cumulative), updated every 2s |
 | Battery | Percentage, plug status, time remaining |
-| Process table | Top 30 by CPU — colour coded red/yellow/normal |
+| Process table | Top 30 by CPU — colour coded red >50% / yellow >20% |
 
 Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme.
 
@@ -245,13 +290,17 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 - [ ] Resolution switching
 - [ ] System shutdown / restart / sleep commands
 - [ ] WhatsApp and other UWP app process name alias map
+- [ ] Wake word detection so voice activates hands-free (no hotkey hold)
+- [ ] Voice feedback — TTS responses so the agent speaks back
+- [ ] Per-app volume control (set Spotify to 40% without touching system volume)
 
 ### Medium Term
 - [ ] Scheduled actions ("mute at 11pm every night") via APScheduler
-- [ ] Voice input via `faster-whisper` for hands-free control
 - [ ] Snapshot and restore system state before profile apply
-- [ ] Multi-monitor brightness support
+- [ ] Multi-monitor support — specify which display to move a window to
+- [ ] Multi-monitor brightness — set brightness per display independently
 - [ ] AMD GPU monitoring support
+- [ ] Clipboard read/write — "copy this text to my clipboard" or "what's in my clipboard"
 
 ### Long Term
 - [ ] Native Windows GUI using PySide6 (no Electron, no web wrapper)
@@ -302,6 +351,7 @@ Open an issue with: OS version, Python version, Ollama model name, and the exact
 - **[pycaw](https://github.com/AndreMiras/pycaw)** — the only sane way to control Windows audio from Python.
 - **[screen-brightness-control](https://github.com/Crozzers/screen-brightness-control)** — handles the messy DDC/CI and WMI layers so you don't have to.
 - **[psutil](https://github.com/giampaolo/psutil)** — reliable cross-platform process and system metrics.
+- **[faster-whisper](https://github.com/SYSTRAN/faster-whisper)** — CTranslate2-based Whisper that runs comfortably on CPU with int8 quantization.
 - **[pyautogui](https://pyautogui.readthedocs.io)** — global media key simulation that actually works.
 - **[pygetwindow](https://github.com/asweigart/PyGetWindow)** — simple and effective window management.
 - **[pywin32](https://github.com/mhammond/pywin32)** — the backbone for any serious Windows API work in Python.

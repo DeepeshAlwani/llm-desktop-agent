@@ -178,15 +178,20 @@ def render_response(response_text: str):
 #   Requires:  pip install sounddevice numpy faster-whisper
 
 SAMPLE_RATE        = 16000          # Whisper expects 16 kHz
-WAKE_PHRASE        = "hello"    # ← change to whatever wake word you like
-WAKE_MODEL_SIZE    = "tiny"         # always-on model — fast and light on CPU
-COMMAND_MODEL_SIZE = "base"         # command model — better accuracy
+WAKE_PHRASE        = "hello"        # ← change to whatever wake word you like
+WAKE_MODEL_SIZE    = "small"        # "small" is still fast but far more accurate than "tiny"
+COMMAND_MODEL_SIZE = "base"        # same model for commands — avoids loading two models
 
 # Tuning
-WAKE_CHUNK_SEC        = 2.0         # seconds per wake-detection chunk (longer = more context for Whisper)
-SILENCE_THRESHOLD     = 0.005       # RMS below this = silence (lowered — was filtering too aggressively)
-SILENCE_TIMEOUT       = 1.8         # seconds of silence to end a command
+WAKE_CHUNK_SEC        = 3.0         # longer chunk = more phonetic context for Whisper (was 2.0)
+SILENCE_THRESHOLD     = 0.10       # RMS below this = silence — raise if mic picks up PC fan noise
+SILENCE_TIMEOUT       = 3.0         # seconds of silence to end a command
 MAX_COMMAND_SEC       = 15          # hard cap on command length
+AUDIO_DEVICE = 1
+
+# Whisper VAD: skip transcription entirely when audio energy is very low.
+# This prevents the model from hallucinating words on ambient noise/silence.
+VAD_ENERGY_THRESHOLD  = 0.008       # chunks quieter than this are skipped without even running Whisper
 
 # Set to True to print what Whisper hears on every chunk — helps diagnose wake-word issues.
 # Turn off once working reliably.
@@ -231,33 +236,57 @@ def _record_until_silence() -> np.ndarray:
     """
     Records short bursts until SILENCE_TIMEOUT seconds of consecutive
     silence or MAX_COMMAND_SEC total.  Returns the full concatenated audio.
-    """
-    chunk_sec    = 5
-    chunk_frames = int(SAMPLE_RATE * chunk_sec)
-    silence_needed = int(SILENCE_TIMEOUT / chunk_sec)
 
-    buffers:       list[np.ndarray] = []
-    silent_chunks: int = 0
-    total_sec:     float = 0.0
+    Uses 0.2 s micro-chunks so silence detection is responsive — the old
+    5-second chunks caused the agent to wait 5 full seconds before stopping,
+    which clipped commands and felt broken.
+    """
+    micro_sec    = 0.2                         # poll every 200 ms
+    micro_frames = int(SAMPLE_RATE * micro_sec)
+
+    buffers:          list[np.ndarray] = []
+    silent_duration:  float = 0.0
+    total_sec:        float = 0.0
+    has_speech:       bool  = False            # don't stop on leading silence
 
     while total_sec < MAX_COMMAND_SEC:
-        chunk = sd.rec(chunk_frames, samplerate=SAMPLE_RATE,
-                       channels=1, dtype="float32", blocking=True).flatten()
+        chunk = sd.rec(micro_frames, samplerate=SAMPLE_RATE,
+                       channels=1, dtype="float32", blocking=True, device=AUDIO_DEVICE).flatten()
         buffers.append(chunk)
-        total_sec += chunk_sec
+        total_sec += micro_sec
 
-        if _rms(chunk) < SILENCE_THRESHOLD:
-            silent_chunks += 1
-            if silent_chunks >= silence_needed:
+        loud = _rms(chunk) >= SILENCE_THRESHOLD
+        if loud:
+            has_speech      = True
+            silent_duration = 0.0
+        elif has_speech:
+            silent_duration += micro_sec
+            if silent_duration >= SILENCE_TIMEOUT:
                 break
-        else:
-            silent_chunks = 0
+        # else: still in leading silence — keep waiting for speech to start
 
     return np.concatenate(buffers) if buffers else np.array([], dtype="float32")
 
 
-def _transcribe(model: "WhisperModel", audio: np.ndarray) -> str:
-    segments, _ = model.transcribe(audio, language="en", beam_size=1)
+def _transcribe(model: "WhisperModel", audio: np.ndarray, initial_prompt: str = "") -> str:
+    """
+    beam_size=5 searches 5 candidates instead of 1 — much more accurate,
+    still fast enough on CPU for short clips.
+    vad_filter skips silent regions so Whisper does not hallucinate on noise.
+    no_speech_threshold returns empty string when the clip is probably not speech.
+    initial_prompt seeds the decoder so it expects phrases like the wake word.
+    """
+    segments, info = model.transcribe(
+        audio,
+        language="en",
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 300},
+        no_speech_threshold=0.6,
+        initial_prompt=initial_prompt or None,
+    )
+    if info.duration == 0 or getattr(info, "no_speech_prob", 0) > 0.8:
+        return ""
     return " ".join(s.text.strip() for s in segments).strip()
 
 
@@ -287,13 +316,35 @@ def _wake_detected(text: str) -> bool:
 
 
 def _similar(a: str, b: str) -> bool:
-    """True if two words are close enough (exact or share 80 %+ of chars)."""
+    """
+    True if two words are phonetically/typographically close enough.
+    Uses normalised Levenshtein edit distance — handles transpositions,
+    insertions, and deletions that the old character-overlap ratio missed.
+    e.g. "helo" vs "hello" = 1 edit in 5 chars = 0.8 similarity → True
+         "hay"  vs "hello" = 3 edits in 5 chars = 0.4 similarity → False
+    """
     if a == b:
         return True
-    # Simple character-overlap ratio (no extra deps needed)
-    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-    matches = sum(c in longer for c in shorter)
-    return matches / max(len(longer), 1) >= 0.75
+    # Levenshtein distance via DP (no extra deps needed)
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return False
+    # Quick length-difference shortcut
+    if abs(la - lb) / max(la, lb) > 0.5:
+        return False
+    dp = list(range(lb + 1))
+    for i in range(1, la + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, lb + 1):
+            temp = dp[j]
+            if a[i - 1] == b[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    dist = dp[lb]
+    similarity = 1 - dist / max(la, lb)
+    return similarity >= 0.70
 
 
 def _strip_wake(text: str) -> str:
@@ -338,11 +389,16 @@ def _voice_thread():
             # ── listen for wake phrase ────────────────────────────────────────
             chunk = _record_chunk(WAKE_CHUNK_SEC)
 
-            # Skip silent chunks to avoid wasting CPU on transcription
-            if _rms(chunk) < SILENCE_THRESHOLD * 0.5:
+            # Skip very quiet chunks — Whisper hallucinates text on silence/noise.
+            # VAD_ENERGY_THRESHOLD is deliberately lower than SILENCE_THRESHOLD so
+            # we only gate out near-total silence, not quiet speech.
+            rms = _rms(chunk)
+            if VOICE_DEBUG:
+                console.print(f"[dim]chunk RMS={rms:.4f}[/dim]", end="")
+            if rms < VAD_ENERGY_THRESHOLD:
                 continue
 
-            wake_text = _transcribe(_load_wake_model(), chunk)
+            wake_text = _transcribe(_load_wake_model(), chunk, initial_prompt=WAKE_PHRASE)
             if not wake_text or not _wake_detected(wake_text):
                 continue
 
@@ -361,7 +417,7 @@ def _voice_thread():
                     console.print(" " * 50, end="\r")
                     continue
                 with console.status("[dim]Transcribing…[/dim]", spinner="dots"):
-                    command_text = _transcribe(_load_command_model(), command_audio)
+                    command_text = _transcribe(_load_command_model(), command_audio, initial_prompt="desktop control command")
 
             command_text = command_text.strip()
             if not command_text:

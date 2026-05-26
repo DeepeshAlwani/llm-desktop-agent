@@ -12,3 +12,9 @@ pywin32==311
 rich==15.0.0
 screen_brightness_control==0.27.1
 textual==8.2.7
+
+# Voice input (optional — agent works without these)
+# Install to enable always-on wake-word voice control
+faster-whisper
+sounddevice
+numpy
