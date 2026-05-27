@@ -15,6 +15,7 @@ import win32gui
 import win32con
 import time
 import psutil
+import pygetwindow  as gw
 
 
 import subprocess
@@ -22,6 +23,7 @@ import re
 import shlex
 
 PROFILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "profiles")
+WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agent_workspace")
 
 BLOCKED_PATTERNS = [
     r"\bdel\b", r"\brd\b", r"\brmdir\b",
@@ -262,8 +264,6 @@ def pause_media() -> str :
         return "I have paused/unpaused the media"
     except Exception as e:
         return f"Failed to pause/unpause the media: {e}"
-    
-import pygetwindow  as gw
 
 @tool("set active window", description="""Use this tool ONLY to bring an already running 
                                             application to the foreground. The app must already be open and running. 

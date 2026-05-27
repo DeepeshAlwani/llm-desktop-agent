@@ -48,6 +48,26 @@ def init_db():
             embedding  BLOB
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS  documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filepath TEXT UNIQUE,
+            filename TEXT,
+            filetype TEXT,       
+            indexed_at TEXT,
+            modified_at TEXT
+                   );
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER,
+            chunk_index INTEGER,
+            content TEXT,
+            embeddings BLOB           
+                   );
+    """)
     
     conn.commit()
     conn.close()

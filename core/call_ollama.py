@@ -464,8 +464,6 @@ memory.init_db()
 memory.start_session(SESSION_ID)
 conversation_history = memory.get_recent_context(session_id=SESSION_ID, n=10)
 
-# register this session
-# (add this to memory.py too — one line insert into sessions table)
 
 MAX_HISTORY = 20
 
