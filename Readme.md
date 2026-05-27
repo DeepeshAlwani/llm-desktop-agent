@@ -83,7 +83,11 @@ Custom pixel-exact placement is also supported via x/y/width/height percentages.
 - **System info queries** — ask in natural language about network, disk, installed software, running processes
 
 ### Interface
-- **Voice input** — hold `Shift+V` to speak, release to send; transcribed entirely locally via faster-whisper (base model, CPU, int8 quantized); no audio ever leaves the machine; Whisper model loads lazily on first use so startup is instant
+- **Voice input** — always-on voice activation using a local wake word (`"hello"`); after activation, queries are transcribed entirely on-device via faster-whisper using two CPU-optimized int8 models:
+  - `tiny` model for lightweight wake-word detection
+  - `base` model for accurate query transcription
+- No audio ever leaves the machine
+- Whisper models load lazily on first use and are cached afterwards for fast startup
 - **Unified input queue** — voice and keyboard both feed the same queue so transcripts are dispatched immediately without pressing Enter
 - **Rich terminal output** — markdown rendering, tables, panels, syntax highlighting
 - **Thinking spinner** — visual feedback while agent is processing
@@ -153,8 +157,9 @@ pip install -r requirements.txt
 # 4. (Optional) Install voice input dependencies
 pip install faster-whisper sounddevice keyboard numpy
 
-# 5. Pull a model via Ollama
+# 5. Pull a models via Ollama
 ollama pull granite4.1:8b
+ollama pull nomic-embed-text-v2-moe
 
 # 6. Run the agent
 cd core
@@ -167,13 +172,16 @@ python call_ollama.py
 
 ## Voice Input
 
-Hold `Shift+V` to record, release to send. The transcript is injected directly into the agent — no Enter key needed.
+The assistant now uses always-on voice activation — just say **"hello"** to wake it up and start speaking your query.
 
-- Runs entirely on CPU using faster-whisper's `base` model with int8 quantization
-- The Whisper model downloads and loads on first use (~150MB, cached afterwards)
-- Change the hotkey by editing `VOICE_HOTKEY` at the top of `call_ollama.py`
-- Change the model size (`tiny` / `base` / `small`) by editing `WHISPER_MODEL_SIZE` — `base` is the recommended balance of speed and accuracy for commands
-- Voice is optional — if the packages aren't installed the agent runs in text-only mode with no errors
+- Runs entirely on CPU using faster-whisper with **two optimized models**:
+  - `tiny` model (int8) for lightweight wake-word detection (`"hello"`)
+  - `base` model (int8) for accurate transcription of the actual query
+- The Whisper models download and load automatically on first use (~200MB combined, cached afterwards)
+- No hotkeys required anymore — voice activation is fully hands-free
+- You can change the wake word by editing the wake-word logic in `call_ollama.py`
+- You can change the transcription model size (`tiny` / `base` / `small`) by editing `WHISPER_MODEL_SIZE`
+- Voice support remains optional — if the required packages are not installed, the agent automatically falls back to text-only mode without errors
 
 ---
 
@@ -285,12 +293,12 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 ## Roadmap
 
 ### Near Term
-- [ ] Memory between sessions (SQLite-backed conversation history)
+- [✔️] Memory between sessions (SQLite-backed conversation history)
 - [ ] Night light toggle via Windows registry
 - [ ] Resolution switching
 - [ ] System shutdown / restart / sleep commands
 - [ ] WhatsApp and other UWP app process name alias map
-- [ ] Wake word detection so voice activates hands-free (no hotkey hold)
+- [✔️] Wake word detection so voice activates hands-free (no hotkey hold)
 - [ ] Voice feedback — TTS responses so the agent speaks back
 - [ ] Per-app volume control (set Spotify to 40% without touching system volume)
 
