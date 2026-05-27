@@ -21,6 +21,8 @@ import subprocess
 import re
 import shlex
 
+PROFILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "profiles")
+
 BLOCKED_PATTERNS = [
     r"\bdel\b", r"\brd\b", r"\brmdir\b",
     r"\bformat\b",
@@ -302,7 +304,7 @@ def adjust_screen_brightness(brightness_value: int) -> str:
 @tool("list_all_saved_profile_names", description="Use this tool to fetch the name of all the custom profiles saved")
 def list_all_saved_profiles_names() -> list:
     try: 
-        folder_path = r"../profiles"
+        folder_path = PROFILES_DIR
         if os.path.exists(folder_path):
             file_list = os.listdir(folder_path)
         else:
@@ -338,7 +340,7 @@ def save_profile(
             "screen_brightness": screen_brightness,
             "volume_level": volume_level
         }
-        file_path = f"profiles/{profile_name}.json"
+        file_path = os.path.join(PROFILES_DIR, f"{profile_name}.json")
         with open(file_path, "w") as f:
             json.dump(profile_dict, f, indent=4)
         app_summary = ", ".join(
@@ -358,7 +360,7 @@ def read_profile(profile_name: str) -> str:
     """
     print("here")
     try:
-        filepath = rf"../profiles/{profile_name}.json"
+        filepath = os.path.join(PROFILES_DIR, f"{profile_name}.json")
 
         with open(filepath, "r") as f:
             data = f.read()
@@ -369,7 +371,7 @@ def read_profile(profile_name: str) -> str:
 @tool("del_profile", description="use this to delete a particular profile")
 def del_profile(profile_name: str, got_confirmation: bool) -> str:
     try:
-        filepath = rf"../profiles/{profile_name}.json"
+        filepath = os.path.join(PROFILES_DIR, f"{profile_name}.json")
         if got_confirmation:
             os.remove(filepath)
         else:

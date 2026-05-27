@@ -22,6 +22,11 @@ try:
 except ImportError:
     VOICE_AVAILABLE = False
 
+import memory
+import uuid
+
+SESSION_ID = str(uuid.uuid4())  # unique ID for this run of the agent
+
 from tools import (
     volume_control,
     mute_device,
@@ -41,7 +46,7 @@ from tools import (
     show_system_monitor,
     kill_process,
     list_all_saved_profiles_names,
-    resize_window,
+    resize_window
 )
 
 agent = create_agent(
@@ -65,7 +70,7 @@ agent = create_agent(
            show_system_monitor,
            kill_process,
            list_all_saved_profiles_names,
-           resize_window,
+           resize_window
            ],
     system_prompt="""You are a Windows computer control assistant.
                         IMPORTANT RULES:
@@ -245,8 +250,8 @@ def _record_until_silence() -> np.ndarray:
     micro_frames = int(SAMPLE_RATE * micro_sec)
 
     buffers:          list[np.ndarray] = []
-    silent_duration:  float = 0.0
-    total_sec:        float = 0.0
+    silent_duration:  float = 2.0
+    total_sec:        float = 15.0
     has_speech:       bool  = False            # don't stop on leading silence
 
     while total_sec < MAX_COMMAND_SEC:
@@ -453,7 +458,16 @@ else:
         "(Voice unavailable — install sounddevice and faster-whisper)[/dim]\n"
     )
 
-conversation_history = []
+memory.init_db()
+
+# seed conversation history with recent past context
+memory.start_session(SESSION_ID)
+conversation_history = memory.get_recent_context(session_id=SESSION_ID, n=10)
+
+# register this session
+# (add this to memory.py too — one line insert into sessions table)
+
+MAX_HISTORY = 20
 
 def _keyboard_thread():
     """Reads typed input in a background thread and feeds it into input_queue."""
@@ -485,8 +499,27 @@ while True:
 
     conversation_history.append({"role": "user", "content": user_input})
 
+    # save user message immediately
+    memory.save_message(SESSION_ID, "user", user_input)
+
+    # retrieve semantically similar past exchanges
+    similar = memory.search_similar(user_input, session_id=SESSION_ID, top_k=5)
+
+    trimmed = conversation_history[-MAX_HISTORY:]
+
+    if similar:
+        context_lines = "\n".join(
+            f"[Past {m['role']}]: {m['content']}"
+            for m in similar
+            if m["score"] > 0.75  # only inject if reasonably relevant
+        )
+        if context_lines:
+            trimmed = [
+                {"role": "system", "content": f"RELEVANT PAST CONTEXT:\n{context_lines}"}
+            ] + trimmed
+
     with console.status("[dim]thinking...[/dim]", spinner="dots"):
-        result = agent.invoke({"messages": conversation_history})
+        result = agent.invoke({"messages": trimmed})
 
     assistant_message = result["messages"][-1]
     blocks = getattr(assistant_message, "content_blocks", None)
@@ -507,6 +540,7 @@ while True:
         response_text = "Action completed."
 
     conversation_history.append({"role": "assistant", "content": response_text})
+    memory.save_message(SESSION_ID, "assistant", response_text)
 
     console.print("[bold green]Assistant:[/bold green]")
     render_response(response_text)
