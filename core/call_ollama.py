@@ -13,6 +13,9 @@ import queue
 import memory
 import uuid
 
+import concurrent.futures
+
+
 # ── Voice input (faster-whisper, always-on wake word) ────────────────────────
 # numpy and sounddevice are top-level so Pylance knows they're always bound.
 # faster_whisper is optional — if missing, voice is silently disabled but the
@@ -25,6 +28,13 @@ try:
     VOICE_AVAILABLE = True
 except ImportError:
     VOICE_AVAILABLE = False
+
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+
 
 SESSION_ID = str(uuid.uuid4())  # unique ID for this run of the agent
 
@@ -240,7 +250,7 @@ VAD_ENERGY_THRESHOLD  = 0.008       # chunks quieter than this are skipped witho
 VOICE_DEBUG = True
 
 # Single queue that both voice and keyboard threads feed into.
-input_queue: queue.Queue[str] = queue.Queue()
+input_queue: queue.Queue[tuple] = queue.Queue()
 
 _wake_model:    "WhisperModel | None" = None
 _command_model: "WhisperModel | None" = None
@@ -261,15 +271,17 @@ def _load_wake_model() -> "WhisperModel":
     global _wake_model
     if _wake_model is None:
         console.print(f"[dim]Loading wake-word model ({WAKE_MODEL_SIZE})…[/dim]")
-        _wake_model = WhisperModel(WAKE_MODEL_SIZE, device="cpu", compute_type="int8")
+        _wake_model = WhisperModel(WAKE_MODEL_SIZE, device="cpu", compute_type="int8", num_workers=2, cpu_threads=4)
     return _wake_model
 
+_model_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_wake_model_future = _model_executor.submit(_load_wake_model)
 
 def _load_command_model() -> "WhisperModel":
     global _command_model
     if _command_model is None:
         console.print(f"[dim]Loading command model ({COMMAND_MODEL_SIZE})…[/dim]")
-        _command_model = WhisperModel(COMMAND_MODEL_SIZE, device="cpu", compute_type="int8")
+        _command_model = WhisperModel(COMMAND_MODEL_SIZE, device="cpu", compute_type="int8", num_workers=2, cpu_threads=4)
     return _command_model
 
 
@@ -428,7 +440,10 @@ def _voice_thread():
        → push transcript to input_queue.
     """
     try:
-        _load_wake_model()
+        import time
+        t0 = time.time()
+        _wake_model_future.result() 
+        print(f"load wake model took: {time.time()-t0:.2f}s")
     except Exception as exc:
         console.print(f"[red]Could not load Whisper: {exc}[/red]")
         return
@@ -477,11 +492,24 @@ def _voice_thread():
                 continue
 
             console.print(f"[bold magenta]🎤 You (voice):[/bold magenta] {command_text}")
-            input_queue.put(command_text)
+            input_queue.put((command_text, True))
 
         except Exception as exc:
             console.print(f"[red]Voice error: {exc}[/red]")
             sd.sleep(500)
+
+def _speak(text: str):
+    """Speak response text in a background thread so it doesn't block the main loop."""
+    if not TTS_AVAILABLE:
+        return
+    def _run():
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 175)   # adjust speed to taste
+        # Strip markdown/symbols so they don't get read aloud literally
+        clean = re.sub(r"[*#`|>\[\]_]", "", text).strip()
+        engine.say(clean)
+        engine.runAndWait()
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -505,10 +533,16 @@ else:
         "(Voice unavailable — install sounddevice and faster-whisper)[/dim]\n"
     )
 
+if TTS_AVAILABLE:
+    console.print('[bold] TTS Enabled [/bold]')
+
 memory.init_db()
 
 # ── File system watcher — keeps the index in sync automatically ───────────────
+import time
+t0 = time.time()
 init_file_db()
+print(f"init_file_db took {time.time()-t0:.2f}s")
 _file_observer = Observer()
 _file_observer.schedule(AgentFileHandler(), WATCHED_FOLDER, recursive=True)
 _file_observer.start()
@@ -534,9 +568,9 @@ def _keyboard_thread():
         while True:
             try:
                 text = prompt("You: ").strip()
-                input_queue.put(text)
+                input_queue.put((text, False))
             except (EOFError, KeyboardInterrupt):
-                input_queue.put("__EXIT__")
+                input_queue.put(("__EXIT__", False))
                 break
 
 keyboard_thread = threading.Thread(target=_keyboard_thread, daemon=True)
@@ -544,7 +578,7 @@ keyboard_thread.start()
 
 while True:
     # Both voice and keyboard feed input_queue — no blocking race condition.
-    user_input = input_queue.get()
+    user_input, from_voice = input_queue.get()
 
     if user_input == "__EXIT__":
         console.print("\n[dim]Goodbye![/dim]")
@@ -604,4 +638,6 @@ while True:
 
     console.print("[bold green]Assistant:[/bold green]")
     render_response(response_text)
+    if from_voice:
+        _speak(response_text)
     console.print()
