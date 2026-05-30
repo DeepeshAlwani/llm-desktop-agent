@@ -794,3 +794,277 @@ def resize_window(
         )
     except Exception as e:
         return f"Failed to resize window: {e}"
+
+# ===========================================================================
+# File management tools  (powered by file_manager.py)
+# ===========================================================================
+import shutil as _shutil
+import numpy as _np
+from file_manager import (
+    WATCHED_FOLDER as _WORKSPACE,
+    read_file_content,
+    index_file,
+    remove_file_from_index,
+    _get_conn as _fm_get_conn,
+    embedder as _fm_embedder,
+    cosine_similarity as _cosine_sim,
+)
+
+
+def _safe_path(user_path: str) -> "tuple[str, str | None]":
+    """Resolve a workspace-relative path; block path traversal."""
+    base = os.path.abspath(_WORKSPACE)
+    resolved = os.path.abspath(os.path.join(base, user_path))
+    if not resolved.startswith(base + os.sep) and resolved != base:
+        return "", f"Access denied: '{user_path}' is outside the workspace."
+    return resolved, None
+
+
+# ── read ──────────────────────────────────────────────────────────────────────
+
+@tool("read_file", description="""Read the full text content of a file in the agent workspace.
+Use when the user says 'read X', 'show me X', 'what is in X', 'open X'.
+The path is relative to the workspace root (e.g. 'notes.txt' or 'src/main.py').""")
+def read_file(filepath: str) -> str:
+    """
+    Args:
+        filepath: path relative to the workspace root, e.g. 'notes.txt'
+    """
+    abs_path, err = _safe_path(filepath)
+    if err:
+        return err
+    if not os.path.isfile(abs_path):
+        return f"File not found: '{filepath}'"
+    return read_file_content(abs_path)
+
+
+# ── write / create ────────────────────────────────────────────────────────────
+
+@tool("write_file", description="""Write (or overwrite) a file in the agent workspace.
+Use when the user says 'write X to file', 'save this as X', 'update file X',
+'create a file called X with ...'. Creates parent folders automatically.
+Re-indexes the file for semantic search after writing.""")
+def write_file(filepath: str, content: str) -> str:
+    """
+    Args:
+        filepath: path relative to the workspace root, e.g. 'notes.txt'
+        content:  full text content to write into the file
+    """
+    abs_path, err = _safe_path(filepath)
+    if err:
+        return err
+    try:
+        os.makedirs(os.path.dirname(abs_path) or abs_path, exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        index_file(abs_path)
+        return f"Written and indexed: '{filepath}'"
+    except Exception as e:
+        return f"Failed to write '{filepath}': {e}"
+
+
+# ── delete ────────────────────────────────────────────────────────────────────
+
+@tool("delete_file", description="""Permanently delete a file or empty folder from the workspace.
+Use when the user says 'delete X', 'remove file X', 'get rid of X'.
+Always confirm with the user before calling this tool.""")
+def delete_file(filepath: str) -> str:
+    """
+    Args:
+        filepath: path relative to the workspace root
+    """
+    abs_path, err = _safe_path(filepath)
+    if err:
+        return err
+    if not os.path.exists(abs_path):
+        return f"Not found: '{filepath}'"
+    try:
+        if os.path.isfile(abs_path):
+            os.remove(abs_path)
+            remove_file_from_index(abs_path)
+            return f"Deleted file: '{filepath}'"
+        elif os.path.isdir(abs_path):
+            os.rmdir(abs_path)
+            return f"Deleted empty folder: '{filepath}'"
+        return f"Cannot delete: '{filepath}'"
+    except OSError as e:
+        return f"Failed to delete '{filepath}': {e}"
+
+
+# ── move / rename ─────────────────────────────────────────────────────────────
+
+@tool("move_file", description="""Move or rename a file/folder inside the workspace.
+Use when the user says 'rename X to Y', 'move X to folder Y', 'reorganise X'.
+Both paths are relative to the workspace root.""")
+def move_file(source: str, destination: str) -> str:
+    """
+    Args:
+        source:      relative path of the file/folder to move
+        destination: relative destination path
+    """
+    src, err = _safe_path(source)
+    if err:
+        return err
+    dst, err = _safe_path(destination)
+    if err:
+        return err
+    if not os.path.exists(src):
+        return f"Source not found: '{source}'"
+    try:
+        os.makedirs(os.path.dirname(dst) or dst, exist_ok=True)
+        _shutil.move(src, dst)
+        remove_file_from_index(src)
+        if os.path.isfile(dst):
+            index_file(dst)
+        return f"Moved '{source}' → '{destination}'"
+    except Exception as e:
+        return f"Failed to move '{source}': {e}"
+
+
+# ── list ──────────────────────────────────────────────────────────────────────
+
+@tool("list_files", description="""List files and subfolders in the workspace (or a subfolder).
+Use when the user says 'list files', 'what files do I have', 'show me the workspace',
+'what is in the X folder'. Pass an empty string to list the workspace root.""")
+def list_files(subfolder: str = "") -> str:
+    """
+    Args:
+        subfolder: relative path inside the workspace to list (empty = root)
+    """
+    if subfolder:
+        abs_path, err = _safe_path(subfolder)
+        if err:
+            return err
+    else:
+        abs_path = os.path.abspath(_WORKSPACE)
+
+    if not os.path.isdir(abs_path):
+        return f"Not a directory: '{subfolder}'"
+    try:
+        entries = sorted(os.scandir(abs_path), key=lambda e: (not e.is_dir(), e.name.lower()))
+        if not entries:
+            return "Empty folder."
+        lines = []
+        for entry in entries:
+            icon = "📁" if entry.is_dir() else "📄"
+            size = f"  ({entry.stat().st_size:,} B)" if entry.is_file() else ""
+            lines.append(f"{icon} {entry.name}{size}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Failed to list '{subfolder}': {e}"
+
+
+# ── name / extension search ───────────────────────────────────────────────────
+
+@tool("search_files", description="""Search for files in the workspace by name or extension.
+Use when the user says 'find files named X', 'find all .py files', 'where is file X'.
+Returns matching relative paths.""")
+def search_files(query: str) -> str:
+    """
+    Args:
+        query: filename fragment or extension to match, e.g. 'report' or '.py'
+    """
+    base = os.path.abspath(_WORKSPACE)
+    matches = []
+    for root, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in files:
+            if query.lower() in fname.lower():
+                matches.append(os.path.relpath(os.path.join(root, fname), base))
+    if not matches:
+        return f"No files found matching '{query}'."
+    return "\n".join(sorted(matches))
+
+
+# ── semantic content search ───────────────────────────────────────────────────
+
+@tool("search_file_content", description="""Semantically search the content of indexed workspace files.
+Use when the user says 'find files about X', 'search my files for X',
+'which file mentions X', 'look for X in the workspace'.
+Returns the most relevant file excerpts ranked by relevance.""")
+def search_file_content(query: str, top_k: int = 5) -> str:
+    """
+    Args:
+        query: natural language description of what to find
+        top_k: max number of results to return (default 5)
+    """
+    try:
+        query_vec = _np.array(_fm_embedder.embed_query(query), dtype=_np.float32)
+        conn = _fm_get_conn()
+        rows = conn.execute("""
+            SELECT c.content, c.embedding, d.filepath
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+        """).fetchall()
+        conn.close()
+
+        if not rows:
+            return "No files have been indexed yet. Try reading or writing a file first."
+
+        base = os.path.abspath(_WORKSPACE)
+        scored = []
+        for content, emb_bytes, filepath in rows:
+            if emb_bytes is None:
+                continue
+            stored = _np.frombuffer(emb_bytes, dtype=_np.float32)
+            score = _cosine_sim(query_vec, stored)
+            rel = os.path.relpath(filepath, base)
+            scored.append((score, rel, content))
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+        results = []
+        for score, rel, content in scored[:top_k]:
+            snippet = content[:300].replace("\n", " ")
+            results.append(f"[{score:.2f}] {rel}\n  {snippet}")
+        return "\n\n".join(results) if results else "No relevant content found."
+    except Exception as e:
+        return f"Search failed: {e}"
+    
+@tool("get_workspace_tree", description="""Show the full recursive folder/file tree of the agent workspace.
+Use when the user says 'show me the folder structure', 'what does the workspace look like',
+'give me an overview of the files', or before doing complex file operations so you understand
+the layout. Returns an indented tree with file sizes.""")
+def get_workspace_tree(subfolder: str = "", max_depth: int = 6) -> str:
+    """
+    Args:
+        subfolder: subfolder to root the tree at (empty = whole workspace)
+        max_depth: how many levels deep to recurse (default 6)
+    """
+    base = os.path.abspath(_WORKSPACE)
+    if subfolder:
+        root = os.path.abspath(os.path.join(base, subfolder))
+        if not root.startswith(base):
+            return "Access denied: path is outside the workspace."
+    else:
+        root = base
+ 
+    if not os.path.isdir(root):
+        return f"Not a directory: '{subfolder or 'workspace'}'"
+ 
+    lines = [f"📁 {os.path.basename(root)}/"]
+ 
+    def _walk(path: str, prefix: str, depth: int):
+        if depth > max_depth:
+            lines.append(f"{prefix}    ... (max depth reached)")
+            return
+        try:
+            entries = sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower()))
+        except PermissionError:
+            lines.append(f"{prefix}    [permission denied]")
+            return
+ 
+        for i, entry in enumerate(entries):
+            is_last = i == len(entries) - 1
+            connector = "└── " if is_last else "├── "
+            child_prefix = prefix + ("    " if is_last else "│   ")
+ 
+            if entry.is_dir():
+                lines.append(f"{prefix}{connector}📁 {entry.name}/")
+                _walk(entry.path, child_prefix, depth + 1)
+            else:
+                size = entry.stat().st_size
+                size_str = f"{size:,} B" if size < 1024 else f"{size/1024:.1f} KB"
+                lines.append(f"{prefix}{connector}📄 {entry.name}  ({size_str})")
+ 
+    _walk(root, "", 1)
+    return "\n".join(lines)

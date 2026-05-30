@@ -4,10 +4,14 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.text import Text
+from prompt_toolkit import prompt
+from prompt_toolkit.patch_stdout import patch_stdout
 import json
 import re
 import threading
 import queue
+import memory
+import uuid
 
 # ── Voice input (faster-whisper, always-on wake word) ────────────────────────
 # numpy and sounddevice are top-level so Pylance knows they're always bound.
@@ -21,9 +25,6 @@ try:
     VOICE_AVAILABLE = True
 except ImportError:
     VOICE_AVAILABLE = False
-
-import memory
-import uuid
 
 SESSION_ID = str(uuid.uuid4())  # unique ID for this run of the agent
 
@@ -46,8 +47,23 @@ from tools import (
     show_system_monitor,
     kill_process,
     list_all_saved_profiles_names,
-    resize_window
+    resize_window,
+    # ── file management ──────────────────────────────────────────────────────
+    read_file,
+    write_file,
+    delete_file,
+    move_file,
+    list_files,
+    search_files,
+    search_file_content,
+    get_workspace_tree
 )
+from file_manager import (
+    WATCHED_FOLDER,
+    AgentFileHandler,
+    init_file_db,
+)
+from watchdog.observers import Observer
 
 agent = create_agent(
     model="ollama:granite4.1:8b",
@@ -70,7 +86,16 @@ agent = create_agent(
            show_system_monitor,
            kill_process,
            list_all_saved_profiles_names,
-           resize_window
+           resize_window,
+           # ── file management ──────────────────────────────────────────────
+           read_file,
+           write_file,
+           delete_file,
+           move_file,
+           list_files,
+           search_files,
+           search_file_content,
+           get_workspace_tree
            ],
     system_prompt="""You are a Windows computer control assistant.
                         IMPORTANT RULES:
@@ -99,6 +124,18 @@ agent = create_agent(
                             but not in VISIBLE WINDOWS — this is normal
                         - To close a tray app use kill_process, to focus a visible window use set_active_window
                         - If an app is not in either list, it is genuinely not running — say so clearly
+
+                        FILE MANAGEMENT (workspace: agent_workspace on Desktop):
+                        - All file paths are relative to the workspace root folder
+                        - Use list_files to browse the workspace or any subfolder
+                        - Use read_file to display a file's content to the user
+                        - Use write_file to create a new file or overwrite an existing one
+                        - Use move_file to rename or reorganise files and folders
+                        - Use delete_file ONLY after the user has explicitly confirmed deletion — always ask first
+                        - Use search_files to find files by name or extension (e.g. 'report', '.py')
+                        - Use search_file_content for semantic/meaning-based search across file contents
+                        - Never read, write, or delete files outside the workspace
+                        - After writing a file, confirm the filename and location to the user
 
                         WINDOW RESIZING:
                         - Use resize_window when the user says 'move X to the left/right',
@@ -207,6 +244,17 @@ input_queue: queue.Queue[str] = queue.Queue()
 
 _wake_model:    "WhisperModel | None" = None
 _command_model: "WhisperModel | None" = None
+
+# ── Debug RMS output (non-intrusive via patch_stdout) ────────────────────────
+# patch_stdout (started in _keyboard_thread) ensures any print() that happens
+# while the user is typing is pushed *above* the prompt, never over it.
+
+def _update_rms(rms: float):
+    """Print RMS value above the input prompt without disturbing typing."""
+    if not VOICE_DEBUG:
+        return
+    colour = "bold green" if rms >= VAD_ENERGY_THRESHOLD else "dim red"
+    console.print(f"[dim]🎙 RMS [/dim][{colour}]{rms:.4f}[/{colour}]")
 
 
 def _load_wake_model() -> "WhisperModel":
@@ -398,8 +446,7 @@ def _voice_thread():
             # VAD_ENERGY_THRESHOLD is deliberately lower than SILENCE_THRESHOLD so
             # we only gate out near-total silence, not quiet speech.
             rms = _rms(chunk)
-            if VOICE_DEBUG:
-                console.print(f"[dim]chunk RMS={rms:.4f}[/dim]", end="")
+            _update_rms(rms)
             if rms < VAD_ENERGY_THRESHOLD:
                 continue
 
@@ -460,6 +507,13 @@ else:
 
 memory.init_db()
 
+# ── File system watcher — keeps the index in sync automatically ───────────────
+init_file_db()
+_file_observer = Observer()
+_file_observer.schedule(AgentFileHandler(), WATCHED_FOLDER, recursive=True)
+_file_observer.start()
+console.print(f"[dim]📁 Watching workspace: {WATCHED_FOLDER}[/dim]\n")
+
 # seed conversation history with recent past context
 memory.start_session(SESSION_ID)
 conversation_history = memory.get_recent_context(session_id=SESSION_ID, n=10)
@@ -468,14 +522,22 @@ conversation_history = memory.get_recent_context(session_id=SESSION_ID, n=10)
 MAX_HISTORY = 20
 
 def _keyboard_thread():
-    """Reads typed input in a background thread and feeds it into input_queue."""
-    while True:
-        try:
-            text = console.input("[bold blue]You:[/bold blue] ").strip()
-            input_queue.put(text)
-        except (EOFError, KeyboardInterrupt):
-            input_queue.put("__EXIT__")
-            break
+    """
+    Reads typed input using prompt_toolkit wrapped in patch_stdout.
+
+    patch_stdout intercepts all writes to stdout/stderr that happen while
+    the prompt is active and redraws them *above* the input line — so RMS
+    debug prints, voice status messages, and agent output never overlap
+    whatever the user is currently typing.
+    """
+    with patch_stdout(raw=True):
+        while True:
+            try:
+                text = prompt("You: ").strip()
+                input_queue.put(text)
+            except (EOFError, KeyboardInterrupt):
+                input_queue.put("__EXIT__")
+                break
 
 keyboard_thread = threading.Thread(target=_keyboard_thread, daemon=True)
 keyboard_thread.start()

@@ -17,7 +17,7 @@
 
 ## What is this?
 
-`llm-desktop-agent` is a fully local AI agent that lets you control your Windows machine through natural language. Ask it to adjust your volume, change screen brightness, open apps, manage profiles, close processes, query system info, or chain multiple actions together — all without touching the cloud.
+`llm-desktop-agent` is a fully local AI agent that lets you control your Windows machine through natural language. Ask it to adjust your volume, change screen brightness, open apps, manage profiles, close processes, query system info, read and write files in your workspace, or chain multiple actions together — all without touching the cloud.
 
 It uses [Ollama](https://ollama.com) to run LLMs locally on your hardware and [LangChain](https://langchain.com) to give the model real tools it can act on. The terminal interface is built with [Rich](https://github.com/Textualize/rich) for clean formatted output, and a live system monitor is available via [Textual](https://github.com/Textualize/textual).
 
@@ -31,11 +31,18 @@ Assistant: Top memory consumers: chrome.exe (892 MB), ollama.exe (4.1 GB), disco
 You: close whatsapp its not needed
 Assistant: Found WhatsApp running in background. Closing it now... Done.
 
-You: open chrome with youtube and google docs side by side
-Assistant: Opened chrome (youtube.com) and chrome (docs.google.com). Arranged side by side.
+You: show me the workspace structure
+Assistant: 📁 agent_workspace/
+├── 📁 projects/
+│   ├── 📄 main.py  (2.1 KB)
+│   └── 📄 utils.py  (890 B)
+└── 📄 notes.txt  (144 B)
 
-You: move chrome to the left half and snap notepad to the right
-Assistant: Moved Chrome to left-half. Moved Notepad to right-half.
+You: create a file called ideas.txt with my three ideas
+Assistant: Written and indexed: 'ideas.txt'
+
+You: find all files about the project deadline
+Assistant: [0.91] notes.txt — "deadline is end of month, need to finish the API layer..."
 ```
 
 ---
@@ -68,13 +75,41 @@ Say things like _"move chrome to the left half"_, _"snap notepad to the top righ
 
 Custom pixel-exact placement is also supported via x/y/width/height percentages.
 
+### File Management
+
+The agent has full read/write access to a sandboxed workspace folder (`agent_workspace/` on your Desktop). All file operations are path-traversal safe — the agent cannot access anything outside this folder.
+
+- **`read_file`** — read the content of any supported file (txt, md, py, js, json, csv, pdf, docx, xlsx, pptx)
+- **`write_file`** — create or overwrite a file; parent folders are created automatically; file is re-indexed for semantic search immediately after writing
+- **`delete_file`** — permanently delete a file or empty folder; always asks for confirmation first
+- **`move_file`** — move or rename files and folders within the workspace
+- **`list_files`** — list the contents of the workspace root or any subfolder with file sizes
+- **`get_workspace_tree`** — show the full recursive folder tree with `├──` connectors and file sizes; the agent calls this automatically before complex file operations to understand the layout
+- **`search_files`** — find files by name or extension (e.g. "find all .py files", "where is report")
+- **`search_file_content`** — semantic search across all indexed file content using vector embeddings; finds files by meaning, not just keyword
+
+Files are indexed into SQLite using [nomic-embed-text](https://ollama.com/library/nomic-embed-text) embeddings and watched automatically via [watchdog](https://github.com/gorakhargosh/watchdog) — any file change on disk (created, modified, deleted) updates the index in real time without restarting the agent.
+
+Supported file types for reading and indexing:
+
+| Extension | Reader |
+|---|---|
+| `.txt`, `.md`, `.py`, `.js`, `.json` | Plain text |
+| `.csv` | `csv` module |
+| `.pdf` | PyMuPDF (`fitz`) — text-based only, scanned PDFs are rejected |
+| `.docx` | `python-docx` |
+| `.xlsx` | openpyxl (via `read_file_content`) |
+| `.pptx` | `python-pptx` |
+
+Code files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, and more) are semantically chunked at the function/method level using [tree-sitter](https://tree-sitter.github.io/tree-sitter/) when the grammar package is installed, falling back to overlapping line chunks otherwise.
+
 ### Intelligence
 - **Profile system** — save and load named configurations with multiple apps, optional URLs per app, volume and brightness (e.g. "study", "gaming", "focus")
 - **Multi-step reasoning** — one request chains multiple tools automatically
 - **System awareness** — checks if apps are already running before opening, detects tray vs visible windows, verifies actions with follow-up tool calls
 - **CMD access** — controlled read/write access to Windows command line split into two tools: read-only queries (`query_system`) and state-changing commands (`run_system_command`) with mandatory user confirmation
 - **Command safety layer** — blocklist of destructive operations (`del`, `format`, `reg delete`, `diskpart`, symlink creation, script file writes, etc.) refused regardless of how they're requested; separate confirmation gate for shutdown, restart, `winget install/uninstall`, and network changes
-- **Persistent conversation** — remembers context within a session
+- **Persistent memory** — SQLite-backed conversation history with semantic retrieval; past relevant exchanges are injected into context automatically using cosine similarity scoring
 
 ### Monitoring
 - **Live system dashboard** — real-time terminal UI showing CPU, RAM, GPU, GPU VRAM, disk read/write MB/s, battery status and time remaining
@@ -113,6 +148,12 @@ Custom pixel-exact placement is also supported via x/y/width/height percentages.
 | [pygetwindow](https://github.com/asweigart/PyGetWindow) | Window focus and management |
 | [pywin32](https://github.com/mhammond/pywin32) | Windows API access, `.lnk` shortcut resolution, low-level window positioning |
 | [comtypes](https://github.com/enthought/comtypes) | COM interface bindings for audio |
+| [langchain-ollama](https://python.langchain.com/docs/integrations/llms/ollama) | Ollama embeddings via LangChain |
+| [watchdog](https://github.com/gorakhargosh/watchdog) | File system event monitoring for live index updates |
+| [tree-sitter](https://tree-sitter.github.io/tree-sitter/) | AST-based semantic chunking of code files (optional) |
+| [PyMuPDF](https://pymupdf.readthedocs.io) | PDF text extraction |
+| [python-docx](https://python-docx.readthedocs.io) | Word document reading |
+| [python-pptx](https://python-pptx.readthedocs.io) | PowerPoint reading |
 | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | Local speech-to-text transcription (optional) |
 | [sounddevice](https://python-sounddevice.readthedocs.io) | Microphone audio capture (optional) |
 | [keyboard](https://github.com/boppreh/keyboard) | Global hotkey detection for push-to-talk (optional) |
@@ -157,11 +198,14 @@ pip install -r requirements.txt
 # 4. (Optional) Install voice input dependencies
 pip install faster-whisper sounddevice keyboard numpy
 
-# 5. Pull a models via Ollama
+# 5. Pull models via Ollama
 ollama pull granite4.1:8b
 ollama pull nomic-embed-text-v2-moe
 
-# 6. Run the agent
+# 6. Create the workspace folder
+mkdir "%USERPROFILE%\Desktop\agent_workspace"
+
+# 7. Run the agent
 cd core
 python call_ollama.py
 ```
@@ -172,15 +216,15 @@ python call_ollama.py
 
 ## Voice Input
 
-The assistant now uses always-on voice activation — just say **"hello"** to wake it up and start speaking your query.
+The assistant uses always-on voice activation — just say **"hello"** to wake it up and start speaking your query.
 
 - Runs entirely on CPU using faster-whisper with **two optimized models**:
   - `tiny` model (int8) for lightweight wake-word detection (`"hello"`)
   - `base` model (int8) for accurate transcription of the actual query
 - The Whisper models download and load automatically on first use (~200MB combined, cached afterwards)
-- No hotkeys required anymore — voice activation is fully hands-free
-- You can change the wake word by editing the wake-word logic in `call_ollama.py`
-- You can change the transcription model size (`tiny` / `base` / `small`) by editing `WHISPER_MODEL_SIZE`
+- No hotkeys required — voice activation is fully hands-free
+- You can change the wake word by editing `WAKE_PHRASE` in `call_ollama.py`
+- You can change the transcription model size (`tiny` / `base` / `small`) by editing `WAKE_MODEL_SIZE` / `COMMAND_MODEL_SIZE`
 - Voice support remains optional — if the required packages are not installed, the agent automatically falls back to text-only mode without errors
 
 ---
@@ -191,16 +235,21 @@ The assistant now uses always-on voice activation — just say **"hello"** to wa
 llm-desktop-agent/
 ├── core/
 │   ├── call_ollama.py      # Agent loop, conversation management, Rich rendering, voice input
-│   ├── tools.py            # All LangChain tools (19 tools)
+│   ├── tools.py            # All LangChain tools (27 tools)
+│   ├── file_manager.py     # File reading, indexing, tree-sitter chunking, watchdog handler
+│   ├── memory.py           # SQLite conversation history and semantic memory retrieval
 │   └── dashboard.py        # Textual live system monitor (launched separately)
 ├── profiles/               # Saved user profiles — auto-created on first save
+├── agent_workspace/        # Sandboxed folder the agent can read/write (on Desktop)
+├── agent_files.db          # SQLite index for workspace files and embeddings
+├── agent_memory.db         # SQLite store for conversation history and embeddings
 ├── assets/
 │   └── preview.png         # Terminal screenshot for README
 ├── requirements.txt
 └── README.md
 ```
 
-The agent logic, tool definitions, and interface are kept intentionally separate so a GUI layer can be dropped in later without touching the core.
+The agent logic, tool definitions, file management, and memory are kept intentionally separate so components can be swapped or extended without touching the others.
 
 ---
 
@@ -212,20 +261,24 @@ User input (typed or voice)
    Unified input queue
    (keyboard thread + voice thread)
         ↓
+   Semantic memory retrieval
+   (past relevant exchanges injected into context)
+        ↓
    LangChain Agent
-   + 19 tool definitions
+   + 27 tool definitions
         ↓
    LLM decides which tool(s) to call and in what order
         ↓
    Python dispatcher executes:
    pycaw / pyautogui / subprocess / sbc / psutil / win32api / win32gui
+   file_manager / sqlite / watchdog / tree-sitter / ollama embeddings
         ↓
    Tool result returned to LLM
         ↓
    Rich-formatted response to user
 ```
 
-The LLM never directly touches your system. It outputs structured tool calls, and Python executes them. Every action is inspectable, restrictable, and extensible.
+The LLM never directly touches your system or files. It outputs structured tool calls, and Python executes them. Every action is inspectable, restrictable, and extensible.
 
 ---
 
@@ -254,6 +307,24 @@ Profile JSON structure:
 ```
 
 Profiles are stored as plain JSON in `profiles/` — human-readable and editable by hand.
+
+---
+
+## File Workspace
+
+The agent's file tools are sandboxed to `agent_workspace/` on your Desktop. Drop any files in there and the watchdog observer will index them automatically on the next change event.
+
+```
+You: show me the workspace structure
+You: read notes.txt
+You: create a file called todo.md with my task list
+You: find all python files
+You: search my files for anything about the API design
+You: rename ideas.txt to brainstorm.txt
+You: delete draft.txt    ← agent will ask you to confirm first
+```
+
+The file index (`agent_files.db`) persists between sessions — files indexed in a previous run are still searchable next time.
 
 ---
 
@@ -294,11 +365,12 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 
 ### Near Term
 - [✔️] Memory between sessions (SQLite-backed conversation history)
+- [✔️] File management — read, write, delete, move, search, semantic content search
+- [✔️] Wake word detection so voice activates hands-free (no hotkey hold)
 - [ ] Night light toggle via Windows registry
 - [ ] Resolution switching
 - [ ] System shutdown / restart / sleep commands
 - [ ] WhatsApp and other UWP app process name alias map
-- [✔️] Wake word detection so voice activates hands-free (no hotkey hold)
 - [ ] Voice feedback — TTS responses so the agent speaks back
 - [ ] Per-app volume control (set Spotify to 40% without touching system volume)
 
@@ -360,6 +432,9 @@ Open an issue with: OS version, Python version, Ollama model name, and the exact
 - **[screen-brightness-control](https://github.com/Crozzers/screen-brightness-control)** — handles the messy DDC/CI and WMI layers so you don't have to.
 - **[psutil](https://github.com/giampaolo/psutil)** — reliable cross-platform process and system metrics.
 - **[faster-whisper](https://github.com/SYSTRAN/faster-whisper)** — CTranslate2-based Whisper that runs comfortably on CPU with int8 quantization.
+- **[watchdog](https://github.com/gorakhargosh/watchdog)** — clean file system event API that made the live index watcher trivial to implement.
+- **[tree-sitter](https://tree-sitter.github.io/tree-sitter/)** — language-aware AST parsing that makes code chunking genuinely semantic rather than just line-splitting.
+- **[PyMuPDF](https://pymupdf.readthedocs.io)** — fast and reliable PDF text extraction.
 - **[pyautogui](https://pyautogui.readthedocs.io)** — global media key simulation that actually works.
 - **[pygetwindow](https://github.com/asweigart/PyGetWindow)** — simple and effective window management.
 - **[pywin32](https://github.com/mhammond/pywin32)** — the backbone for any serious Windows API work in Python.
