@@ -35,6 +35,20 @@ try:
 except ImportError:
     TTS_AVAILABLE = False
 
+import tiktoken
+
+CONTEXT_WINDOW = 131_072  # confirmed from model_info
+_enc = tiktoken.get_encoding("cl100k_base")  # closest to Granite's gpt2/dbrx BPE
+
+def _count_tokens(messages: list[dict]) -> int:
+    total = 0
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, str):
+            total += len(_enc.encode(content))
+        total += 4  # per-message overhead (role, separators)
+    return total
+
 
 SESSION_ID = str(uuid.uuid4())  # unique ID for this run of the agent
 
@@ -235,19 +249,19 @@ WAKE_MODEL_SIZE    = "small"        # "small" is still fast but far more accurat
 COMMAND_MODEL_SIZE = "base"        # same model for commands — avoids loading two models
 
 # Tuning
-WAKE_CHUNK_SEC        = 3.0         # longer chunk = more phonetic context for Whisper (was 2.0)
-SILENCE_THRESHOLD     = 0.10       # RMS below this = silence — raise if mic picks up PC fan noise
+WAKE_CHUNK_SEC        = 4.0         # longer chunk = more phonetic context for Whisper (was 2.0)
+SILENCE_THRESHOLD     = 0.05       # RMS below this = silence — raise if mic picks up PC fan noise
 SILENCE_TIMEOUT       = 3.0         # seconds of silence to end a command
-MAX_COMMAND_SEC       = 15          # hard cap on command length
+MAX_COMMAND_SEC       = 18         # hard cap on command length
 AUDIO_DEVICE = 1
 
 # Whisper VAD: skip transcription entirely when audio energy is very low.
 # This prevents the model from hallucinating words on ambient noise/silence.
-VAD_ENERGY_THRESHOLD  = 0.008       # chunks quieter than this are skipped without even running Whisper
+VAD_ENERGY_THRESHOLD  = 0.00       # chunks quieter than this are skipped without even running Whisper
 
 # Set to True to print what Whisper hears on every chunk — helps diagnose wake-word issues.
 # Turn off once working reliably.
-VOICE_DEBUG = True
+VOICE_DEBUG = False
 
 # Single queue that both voice and keyboard threads feed into.
 input_queue: queue.Queue[tuple] = queue.Queue()
@@ -310,8 +324,8 @@ def _record_until_silence() -> np.ndarray:
     micro_frames = int(SAMPLE_RATE * micro_sec)
 
     buffers:          list[np.ndarray] = []
-    silent_duration:  float = 2.0
-    total_sec:        float = 15.0
+    silent_duration:  float = 0.0
+    total_sec:        float = 0.0
     has_speech:       bool  = False            # don't stop on leading silence
 
     while total_sec < MAX_COMMAND_SEC:
@@ -600,6 +614,15 @@ while True:
     similar = memory.search_similar(user_input, session_id=SESSION_ID, top_k=5)
 
     trimmed = conversation_history[-MAX_HISTORY:]
+
+    used = _count_tokens(trimmed)
+    pct  = used / CONTEXT_WINDOW
+    color = "green" if pct < 0.6 else "yellow" if pct < 0.85 else "red"
+    console.print(
+        f"[dim]Context: [{color}]{used:,} / {CONTEXT_WINDOW:,}[/{color}] "
+        f"({pct*100:.0f}%) — {CONTEXT_WINDOW - used:,} tokens remaining[/dim]"
+    )
+
 
     if similar:
         context_lines = "\n".join(

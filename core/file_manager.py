@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import numpy as np
 from datetime import datetime
@@ -7,9 +8,178 @@ from typing import Optional
 from langchain_ollama import OllamaEmbeddings
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from docx import Document
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent_files.db")
 WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agent_workspace")
+
+def add_formatted_runs(paragraph, text):
+    """
+    Add formatted runs to an existing paragraph.
+    Supports:
+        **bold**
+        *italic*
+        __underline__
+        `inline code`
+    """
+
+    pattern = r'(\*\*.*?\*\*|__.*?__|\*.*?\*|`.*?`|[^*_`]+)'
+
+    for segment in re.findall(pattern, text):
+        run = paragraph.add_run()
+
+        if segment.startswith("**") and segment.endswith("**"):
+            run.text = segment[2:-2]
+            run.bold = True
+
+        elif segment.startswith("__") and segment.endswith("__"):
+            run.text = segment[2:-2]
+            run.underline = True
+
+        elif segment.startswith("*") and segment.endswith("*"):
+            run.text = segment[1:-1]
+            run.italic = True
+
+        elif segment.startswith("`") and segment.endswith("`"):
+            run.text = segment[1:-1]
+            run.font.name = "Courier New"
+
+        else:
+            run.text = segment
+
+
+def add_formatted_paragraph(doc, line):
+    para = doc.add_paragraph()
+    add_formatted_runs(para, line)
+    return para
+
+
+def _flush_table(doc, raw_lines):
+    """
+    Convert markdown table into docx table.
+    """
+
+    rows = []
+
+    for line in raw_lines:
+
+        # Skip separator row
+        if re.match(r"^\|[\s:\-|]+\|$", line.strip()):
+            continue
+
+        row = [
+            cell.strip()
+            for cell in line.strip().strip("|").split("|")
+        ]
+
+        rows.append(row)
+
+    if not rows:
+        return
+
+    max_cols = max(len(row) for row in rows)
+
+    table = doc.add_table(rows=len(rows), cols=max_cols)
+    table.style = "Table Grid"
+
+    for r_idx, row in enumerate(rows):
+        for c_idx, cell_text in enumerate(row):
+
+            cell = table.cell(r_idx, c_idx)
+
+            # remove default paragraph text
+            cell.text = ""
+
+            para = cell.paragraphs[0]
+            add_formatted_runs(para, cell_text)
+
+
+def write_docx(filepath, content):
+    document = Document()
+
+    lines = content.split("\n")
+
+    table_buffer = []
+
+    for line in lines:
+
+        stripped = line.strip()
+
+        # ------------------------
+        # TABLE HANDLING
+        # ------------------------
+        if stripped.startswith("|"):
+            table_buffer.append(line)
+            continue
+
+        if table_buffer:
+            _flush_table(document, table_buffer)
+            table_buffer = []
+
+        # ------------------------
+        # HEADINGS
+        # ------------------------
+        if line.startswith("#"):
+
+            level = len(line) - len(line.lstrip("#"))
+
+            heading_text = line.lstrip("#").strip()
+
+            # add heading
+            para = document.add_heading(level=min(level, 9))
+
+            add_formatted_runs(para, heading_text)
+
+        # ------------------------
+        # BULLET LIST
+        # ------------------------
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+
+            para = document.add_paragraph(style="List Bullet")
+
+            add_formatted_runs(
+                para,
+                stripped[2:].strip()
+            )
+
+        # ------------------------
+        # NUMBERED LIST
+        # ------------------------
+        elif re.match(r"^\d+\.\s+", stripped):
+
+            text = re.sub(
+                r"^\d+\.\s+",
+                "",
+                stripped
+            )
+
+            para = document.add_paragraph(style="List Number")
+
+            add_formatted_runs(
+                para,
+                text
+            )
+
+        # ------------------------
+        # BLANK LINE
+        # ------------------------
+        elif stripped == "":
+            continue
+
+        # ------------------------
+        # NORMAL PARAGRAPH
+        # ------------------------
+        else:
+            add_formatted_paragraph(
+                document,
+                line
+            )
+
+    # Flush final table
+    if table_buffer:
+        _flush_table(document, table_buffer)
+
+    document.save(filepath)
 
 def _get_conn():
     return sqlite3.connect(DB_PATH)

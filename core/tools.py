@@ -16,6 +16,22 @@ import win32con
 import time
 import psutil
 import pygetwindow  as gw
+from file_manager import write_docx
+
+import shutil as _shutil
+import numpy as _np
+from file_manager import (
+    WATCHED_FOLDER as _WORKSPACE,
+    read_file_content,
+    index_file,
+    remove_file_from_index,
+    _get_conn as _fm_get_conn,
+    embedder as _fm_embedder,
+    cosine_similarity as _cosine_sim,
+    write_docx,
+    get_file_type
+)
+
 
 
 import subprocess
@@ -798,17 +814,6 @@ def resize_window(
 # ===========================================================================
 # File management tools  (powered by file_manager.py)
 # ===========================================================================
-import shutil as _shutil
-import numpy as _np
-from file_manager import (
-    WATCHED_FOLDER as _WORKSPACE,
-    read_file_content,
-    index_file,
-    remove_file_from_index,
-    _get_conn as _fm_get_conn,
-    embedder as _fm_embedder,
-    cosine_similarity as _cosine_sim,
-)
 
 
 def _safe_path(user_path: str) -> "tuple[str, str | None]":
@@ -855,8 +860,11 @@ def write_file(filepath: str, content: str) -> str:
         return err
     try:
         os.makedirs(os.path.dirname(abs_path) or abs_path, exist_ok=True)
-        with open(abs_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        if get_file_type(filepath) == ".docx" or get_file_type(filepath) == "docx":
+            write_docx(abs_path, content)
+        else:
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(content)
         index_file(abs_path)
         return f"Written and indexed: '{filepath}'"
     except Exception as e:

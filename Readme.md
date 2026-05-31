@@ -123,6 +123,8 @@ Code files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, and more) are sem
   - `base` model for accurate query transcription
 - No audio ever leaves the machine
 - Whisper models load lazily on first use and are cached afterwards for fast startup
+- **Voice feedback (TTS)** — voice commands are answered aloud via pyttsx3; the agent speaks its response back to you entirely on-device. Keyboard input stays silent — only voice-triggered commands get spoken responses, keeping the two modes cleanly separated
+- No audio ever leaves the machine
 - **Unified input queue** — voice and keyboard both feed the same queue so transcripts are dispatched immediately without pressing Enter
 - **Rich terminal output** — markdown rendering, tables, panels, syntax highlighting
 - **Thinking spinner** — visual feedback while agent is processing
@@ -157,6 +159,7 @@ Code files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, and more) are sem
 | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | Local speech-to-text transcription (optional) |
 | [sounddevice](https://python-sounddevice.readthedocs.io) | Microphone audio capture (optional) |
 | [keyboard](https://github.com/boppreh/keyboard) | Global hotkey detection for push-to-talk (optional) |
+| [pyttsx3](https://github.com/nateshmbhat/pyttsx3) | Offline text-to-speech for voice responses (optional) |
 
 Every single dependency is free and open source.
 
@@ -371,7 +374,7 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 - [ ] Resolution switching
 - [ ] System shutdown / restart / sleep commands
 - [ ] WhatsApp and other UWP app process name alias map
-- [ ] Voice feedback — TTS responses so the agent speaks back
+- [✔️] Voice feedback — TTS responses so the agent speaks back
 - [ ] Per-app volume control (set Spotify to 40% without touching system volume)
 
 ### Medium Term
@@ -438,6 +441,7 @@ Open an issue with: OS version, Python version, Ollama model name, and the exact
 - **[pyautogui](https://pyautogui.readthedocs.io)** — global media key simulation that actually works.
 - **[pygetwindow](https://github.com/asweigart/PyGetWindow)** — simple and effective window management.
 - **[pywin32](https://github.com/mhammond/pywin32)** — the backbone for any serious Windows API work in Python.
+- **[pyttsx3](https://github.com/nateshmbhat/pyttsx3)** — dead-simple offline TTS that runs entirely on-device via Windows SAPI; no model downloads, no API keys.
 
 ---
 

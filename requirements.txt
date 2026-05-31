@@ -1,20 +1,29 @@
 # Python 3.12.4
 comtypes==1.4.16
+fitz==0.0.1.dev2
 gputil==1.4.0
-langchain==1.3.1
+huggingface_hub==1.17.0
+langchain==1.3.2
+langchain-ollama==1.1.0
 langchain-ollama
 langgraph
+prompt_toolkit==3.0.52
 psutil==7.2.2
 pyautogui==0.9.54
 pycaw==20251023
 pygetwindow==0.0.9
+python-docx==1.2.0
+python-pptx==1.0.2
+pyttsx3==2.99
 pywin32==311
 rich==15.0.0
 screen_brightness_control==0.27.1
 textual==8.2.7
+tree-sitter==0.25.2
+watchdog==6.0.0
+tiktoken==0.13.0
 
 # Voice input (optional — agent works without these)
-# Install to enable always-on wake-word voice control
-faster-whisper
-sounddevice
-numpy
+faster-whisper==1.2.1
+sounddevice==0.5.1
+numpy==2.4.6
