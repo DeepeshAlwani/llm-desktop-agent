@@ -17,6 +17,8 @@ import time
 import psutil
 import pygetwindow  as gw
 from file_manager import write_docx
+from ppt_agent import run_ppt_agent
+
 
 import shutil as _shutil
 import numpy as _np
@@ -110,6 +112,62 @@ def _run_command(command: str, timeout: int = 15) -> str:
     except Exception as e:
         return f"Failed to run command: {e}"
 
+
+@tool("web_search", description="""Search the internet for current information.
+Use for news, recent events, live data, or anything that may have changed since training.
+Always cite the source URLs in your reply.""")
+def web_search(query: str, max_results: int = 5) -> str:
+    """
+    Args:
+        query:       The search query.
+        max_results: Number of results to return (1-10).
+    """
+    max_results = max(1, min(10, max_results))
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        return "Error: run 'pip install duckduckgo-search' first."
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+    except Exception as e:
+        return f"Search failed: {e}"
+    if not results:
+        return f"No results found for: '{query}'"
+    lines = [f"Results for: {query}\n"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r.get('title', '')}")
+        lines.append(f"   {r.get('body', '')[:250]}")
+        lines.append(f"   Source: {r.get('href', '')}\n")
+    return "\n".join(lines)
+
+
+@tool("call_ppt_agent", description="""Delegate PowerPoint creation to the dedicated PPT sub-agent.
+Use whenever the user asks to make a PowerPoint, create a deck, or build slides about any topic.
+ 
+The sub-agent will autonomously:
+  1. Invent a full colour palette (hex values) tailored to the topic
+  2. Write 6-8 slides with rich per-element formatting (bold, italic, font sizes)
+  3. Search DuckDuckGo for images and embed them into image slides
+  4. Save the finished .pptx to the workspace
+ 
+When calling this tool, pass a DETAILED task string that includes:
+  • Topic  (required)
+  • Number of slides if the user specified one
+  • Theme hints: dark / light / a mood / brand colours the user mentioned
+  • Desired filename if the user gave one
+ 
+Example call:
+  task = "Create a 7-slide dark-theme deck about climate change, save as climate.pptx"
+ 
+Returns the saved file path on success, or an error string on failure.
+After success, offer to open the file with open_application.""")
+def call_ppt_agent(task: str) -> str:
+    """
+    Args:
+        task: Full natural-language description of the desired presentation.
+    """
+    return run_ppt_agent(task)
 
 @tool("query_system", description="""Run a read-only system query command in cmd. 
 Use for checking system info, network status, running processes, installed software, 

@@ -2,6 +2,7 @@ import os
 import re
 import sqlite3
 import numpy as np
+import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -9,6 +10,12 @@ from langchain_ollama import OllamaEmbeddings
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from docx import Document
+import io
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
+
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent_files.db")
 WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agent_workspace")
@@ -180,6 +187,225 @@ def write_docx(filepath, content):
         _flush_table(document, table_buffer)
 
     document.save(filepath)
+
+def write_pptx(filepath: str, spec: dict) -> str:
+    """
+    Render a pre-designed slide spec dict into a .pptx file.
+    Called by build_pptx tool in ppt_agent.py.
+    
+    spec keys:
+        slides  – list of slide dicts from design_slides
+        theme   – 'dark' or 'light'
+        _images – dict of { image_query: latin-1 encoded bytes } from fetch_slide_image
+    """
+    # ── Palettes ──────────────────────────────────────────────────────────────
+    dark = {
+        "bg":      RGBColor(0x1E, 0x27, 0x61),
+        "bg_alt":  RGBColor(0x14, 0x1B, 0x47),
+        "accent":  RGBColor(0xCA, 0xDC, 0xFC),
+        "heading": RGBColor(0xFF, 0xFF, 0xFF),
+        "body":    RGBColor(0xCA, 0xDC, 0xFC),
+        "muted":   RGBColor(0x8A, 0xA0, 0xD0),
+    }
+    light = {
+        "bg":      RGBColor(0xFF, 0xFF, 0xFF),
+        "bg_alt":  RGBColor(0xF0, 0xF4, 0xFF),
+        "accent":  RGBColor(0x18, 0x5F, 0xA5),
+        "heading": RGBColor(0x1E, 0x27, 0x61),
+        "body":    RGBColor(0x33, 0x3A, 0x50),
+        "muted":   RGBColor(0x66, 0x72, 0x90),
+    }
+
+    theme  = spec.get("theme", "dark").lower()
+    pal    = dark if theme == "dark" else light
+    images = spec.get("_images", {})  # { image_query: latin-1 str }
+
+    prs = Presentation()
+    prs.slide_width  = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _slide():
+        return prs.slides.add_slide(prs.slide_layouts[6])  # blank
+
+    def _bg(sl, color):
+        f = sl.background.fill
+        f.solid()
+        f.fore_color.rgb = color
+
+    def _tb(sl, l, t, w, h):
+        return sl.shapes.add_textbox(
+            Inches(l), Inches(t), Inches(w), Inches(h)
+        )
+
+    def _p(tf, text, size, bold=False, color=None, align=PP_ALIGN.LEFT):
+        p = tf.add_paragraph()
+        p.text = text
+        p.alignment = align
+        r = p.runs[0] if p.runs else p.add_run()
+        r.font.size      = Pt(size)
+        r.font.bold      = bold
+        r.font.color.rgb = color or pal["body"]
+        p.space_before   = Pt(4)
+
+    def _bar(sl, y, h=0.06):
+        b = sl.shapes.add_shape(
+            1, Inches(0.5), Inches(y), Inches(12.33), Inches(h)
+        )
+        b.fill.solid()
+        b.fill.fore_color.rgb = pal["accent"]
+        b.line.fill.background()
+
+    def _bullets(sl, items, left, top, width):
+        tb = _tb(sl, left, top, width, 5.7)
+        tf = tb.text_frame
+        tf.word_wrap = True
+        first = True
+        for b in items:
+            p = tf.paragraphs[0] if first else tf.add_paragraph()
+            first = False
+            p.text = f"▸  {b}"
+            r = p.runs[0] if p.runs else p.add_run()
+            r.font.size      = Pt(17)
+            r.font.color.rgb = pal["body"]
+            p.space_before   = Pt(5)
+
+    def _get_image(query: str) -> io.BytesIO | None:
+        """
+        Return a BytesIO for the image.
+        Priority: pre-fetched bytes from _images → live Unsplash → PIL placeholder.
+        """
+        # 1. pre-fetched by the sub-agent
+        raw = images.get(query, "")
+        if raw:
+            return io.BytesIO(raw.encode("latin-1"))
+
+        # 2. live fetch (fallback if sub-agent skipped it)
+        try:
+            url = f"https://source.unsplash.com/560x420/?{query.replace(' ', ',')}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200 and r.content:
+                return io.BytesIO(r.content)
+        except Exception:
+            pass
+
+        # 3. solid-colour placeholder so the deck always builds
+        try:
+            from PIL import Image
+            img = Image.new("RGB", (560, 420), (60, 80, 120))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            return buf
+        except Exception:
+            return None
+
+    # ── Layout renderers ──────────────────────────────────────────────────────
+
+    def _title(s):
+        sl = _slide()
+        _bg(sl, pal["bg"])
+        _bar(sl, 6.9, 0.12)
+        _p(_tb(sl, 0.8, 2.2, 11.73, 1.8).text_frame,
+           s.get("heading", ""), 52, True, pal["heading"], PP_ALIGN.CENTER)
+        if s.get("subheading"):
+            _p(_tb(sl, 0.8, 4.2, 11.73, 0.8).text_frame,
+               s["subheading"], 22, color=pal["muted"], align=PP_ALIGN.CENTER)
+
+    def _section(s):
+        sl = _slide()
+        _bg(sl, pal["bg_alt"])
+        _bar(sl, 3.55, 0.08)
+        _p(_tb(sl, 0.8, 2.6, 11.73, 1.4).text_frame,
+           s.get("heading", ""), 40, True, pal["heading"], PP_ALIGN.CENTER)
+        if s.get("subheading"):
+            _p(_tb(sl, 0.8, 4.1, 11.73, 0.7).text_frame,
+               s["subheading"], 20, color=pal["muted"], align=PP_ALIGN.CENTER)
+
+    def _content(s):
+        sl = _slide()
+        _bg(sl, pal["bg"])
+        _bar(sl, 1.15)
+        _p(_tb(sl, 0.5, 0.3, 12.33, 0.8).text_frame,
+           s.get("heading", ""), 28, True, pal["heading"])
+        if s.get("bullets"):
+            _bullets(sl, s["bullets"], 0.6, 1.35, 12.13)
+
+    def _two_column(s):
+        sl = _slide()
+        _bg(sl, pal["bg"])
+        _bar(sl, 1.15)
+        _p(_tb(sl, 0.5, 0.3, 12.33, 0.8).text_frame,
+           s.get("heading", ""), 28, True, pal["heading"])
+        if s.get("bullets"):
+            _bullets(sl, s["bullets"], 0.5, 1.35, 5.9)
+        if s.get("right_bullets"):
+            _bullets(sl, s["right_bullets"], 6.8, 1.35, 5.9)
+        # vertical divider
+        div = sl.shapes.add_shape(
+            1, Inches(6.6), Inches(1.25), Inches(0.02), Inches(5.7)
+        )
+        div.fill.solid()
+        div.fill.fore_color.rgb = pal["accent"]
+        div.line.fill.background()
+
+    def _image_right(s):
+        sl = _slide()
+        _bg(sl, pal["bg"])
+        _bar(sl, 1.15)
+        _p(_tb(sl, 0.5, 0.3, 7.3, 0.8).text_frame,
+           s.get("heading", ""), 26, True, pal["heading"])
+        if s.get("bullets"):
+            _bullets(sl, s["bullets"], 0.6, 1.35, 7.1)
+        query = s.get("image_query", s.get("heading", "abstract"))
+        buf = _get_image(query)
+        if buf:
+            sl.shapes.add_picture(buf, Inches(8.0), Inches(1.3), Inches(4.8), Inches(5.6))
+
+    def _big_stat(s):
+        sl = _slide()
+        _bg(sl, pal["bg_alt"])
+        _bar(sl, 1.15)
+        _p(_tb(sl, 0.5, 0.3, 12.33, 0.8).text_frame,
+           s.get("heading", ""), 26, True, pal["heading"])
+        _p(_tb(sl, 0.5, 1.8, 12.33, 2.8).text_frame,
+           s.get("stat", ""), 96, True, pal["accent"], PP_ALIGN.CENTER)
+        if s.get("stat_label"):
+            _p(_tb(sl, 0.5, 4.7, 12.33, 0.7).text_frame,
+               s["stat_label"].upper(), 18, color=pal["muted"], align=PP_ALIGN.CENTER)
+
+    def _closing(s):
+        sl = _slide()
+        _bg(sl, pal["bg"])
+        _bar(sl, 3.55, 0.1)
+        _p(_tb(sl, 0.8, 2.2, 11.73, 1.4).text_frame,
+           s.get("heading", "Thank You"), 48, True, pal["heading"], PP_ALIGN.CENTER)
+        if s.get("subheading"):
+            _p(_tb(sl, 0.8, 3.9, 11.73, 0.8).text_frame,
+               s["subheading"], 20, color=pal["muted"], align=PP_ALIGN.CENTER)
+
+    # ── Dispatch ──────────────────────────────────────────────────────────────
+
+    renderers = {
+        "title":       _title,
+        "section":     _section,
+        "content":     _content,
+        "two_column":  _two_column,
+        "image_right": _image_right,
+        "big_stat":    _big_stat,
+        "closing":     _closing,
+    }
+
+    for slide in spec.get("slides", []):
+        layout = slide.get("layout", "content")
+        renderers.get(layout, _content)(slide)
+
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    prs.save(filepath)
+    print(f"{filepath}")
+    return f"Saved {len(spec.get('slides', []))} slides → {filepath}"
+
 
 def _get_conn():
     return sqlite3.connect(DB_PATH)

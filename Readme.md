@@ -88,7 +88,9 @@ The agent has full read/write access to a sandboxed workspace folder (`agent_wor
 - **`search_files`** — find files by name or extension (e.g. "find all .py files", "where is report")
 - **`search_file_content`** — semantic search across all indexed file content using vector embeddings; finds files by meaning, not just keyword
 
-Files are indexed into SQLite using [nomic-embed-text](https://ollama.com/library/nomic-embed-text) embeddings and watched automatically via [watchdog](https://github.com/gorakhargosh/watchdog) — any file change on disk (created, modified, deleted) updates the index in real time without restarting the agent.
+Files are indexed into SQLite using [nomic-embed-text-v2-moe](https://ollama.com/library/nomic-embed-text) embeddings (upgraded from `nomic-embed-text`) and watched automatically via [watchdog](https://github.com/gorakhargosh/watchdog) — any file change on disk (created, modified, deleted) updates the index in real time without restarting the agent.
+
+The `write_file` tool also supports writing **`.docx` Word documents** directly from markdown. When the content contains headings (`#`), bullets (`-`), numbered lists, or markdown tables, `file_manager.write_docx` converts them to proper Word formatting — including bold/italic/underline runs, native table grids, and list styles. This means the agent can produce structured Word documents without any extra instructions.
 
 Supported file types for reading and indexing:
 
@@ -107,9 +109,30 @@ Code files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, and more) are sem
 - **Profile system** — save and load named configurations with multiple apps, optional URLs per app, volume and brightness (e.g. "study", "gaming", "focus")
 - **Multi-step reasoning** — one request chains multiple tools automatically
 - **System awareness** — checks if apps are already running before opening, detects tray vs visible windows, verifies actions with follow-up tool calls
+- **Web search** — the agent can search the web and return results inline via the `web_search` tool
 - **CMD access** — controlled read/write access to Windows command line split into two tools: read-only queries (`query_system`) and state-changing commands (`run_system_command`) with mandatory user confirmation
 - **Command safety layer** — blocklist of destructive operations (`del`, `format`, `reg delete`, `diskpart`, symlink creation, script file writes, etc.) refused regardless of how they're requested; separate confirmation gate for shutdown, restart, `winget install/uninstall`, and network changes
 - **Persistent memory** — SQLite-backed conversation history with semantic retrieval; past relevant exchanges are injected into context automatically using cosine similarity scoring
+- **Context window tracking** — tiktoken token count is displayed before every agent call, colour-coded green/yellow/red and showing tokens remaining against the model's 131,072-token context window
+
+### Presentation Creation
+
+The agent can generate fully-designed `.pptx` files autonomously. Say things like _"make me a presentation on climate change"_ or _"create a 7-slide deck on Python for beginners"_ and it will produce a polished file in your workspace.
+
+- **`call_ppt_agent`** — a dedicated sub-agent (`ppt_agent.py`) runs the entire pipeline independently
+- The LLM outputs a structured **XML spec** containing a custom colour palette and slide-by-slide content
+- **7 available layouts**: `title`, `section`, `content`, `two_column`, `image_right`, `big_stat`, `closing`
+- **Per-element rich text** — every heading, subheading, and bullet item supports `bold`, `italic`, `size`, and `align` attributes
+- **LLM-generated palettes** — the model invents a colour scheme that matches the topic's mood (e.g. saffron + green for India, teal + deep blue for ocean/science)
+- **Automatic images** — `image_right` slides fetch real photos via DuckDuckGo Images (no API key), saved locally to `_ppt_images/`; a solid-colour placeholder is used if nothing downloads
+- **`pill_label` overrides** — each slide can display a small topic-specific tab label (e.g. "TIMELINE", "KEY FIGURES") instead of a generic one
+- The finished `.pptx` is saved to `agent_workspace/` and indexed for semantic search automatically
+
+```
+You: make a presentation on the history of computing
+Assistant: Designed 7 slides with custom palette → Saved to agent_workspace/history_of_computing.pptx
+           Want me to open it?
+```
 
 ### Monitoring
 - **Live system dashboard** — real-time terminal UI showing CPU, RAM, GPU, GPU VRAM, disk read/write MB/s, battery status and time remaining
@@ -154,8 +177,9 @@ Code files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, and more) are sem
 | [watchdog](https://github.com/gorakhargosh/watchdog) | File system event monitoring for live index updates |
 | [tree-sitter](https://tree-sitter.github.io/tree-sitter/) | AST-based semantic chunking of code files (optional) |
 | [PyMuPDF](https://pymupdf.readthedocs.io) | PDF text extraction |
-| [python-docx](https://python-docx.readthedocs.io) | Word document reading |
-| [python-pptx](https://python-pptx.readthedocs.io) | PowerPoint reading |
+| [python-docx](https://python-docx.readthedocs.io) | Word document reading and markdown→docx writing |
+| [python-pptx](https://python-pptx.readthedocs.io) | PowerPoint reading and PPTX generation (via ppt_renderer) |
+| [tiktoken](https://github.com/openai/tiktoken) | Token counting for context window tracking |
 | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | Local speech-to-text transcription (optional) |
 | [sounddevice](https://python-sounddevice.readthedocs.io) | Microphone audio capture (optional) |
 | [keyboard](https://github.com/boppreh/keyboard) | Global hotkey detection for push-to-talk (optional) |
@@ -215,6 +239,16 @@ python call_ollama.py
 
 > **Note:** Run from Windows Terminal (not VS Code's integrated terminal) for best results. The live system monitor spawns a new terminal window and requires full TTY support.
 
+### Diagnosing slow startup
+
+If the agent takes a long time to start, run the standalone diagnostic:
+
+```bash
+python diagnose_startup.py
+```
+
+This times each startup phase independently (Python imports, Whisper model loading, DB init, watchdog observer start, etc.) and prints a colour-coded summary table highlighting any phase over 5 seconds.
+
 ---
 
 ## Voice Input
@@ -222,13 +256,16 @@ python call_ollama.py
 The assistant uses always-on voice activation — just say **"hello"** to wake it up and start speaking your query.
 
 - Runs entirely on CPU using faster-whisper with **two optimized models**:
-  - `tiny` model (int8) for lightweight wake-word detection (`"hello"`)
+  - `small` model (int8) for wake-word detection (`"hello"`) — upgraded from `tiny` for better accuracy
   - `base` model (int8) for accurate transcription of the actual query
 - The Whisper models download and load automatically on first use (~200MB combined, cached afterwards)
+- The wake model loads in a background thread (`ThreadPoolExecutor`) at startup so it is ready before you speak
 - No hotkeys required — voice activation is fully hands-free
 - You can change the wake word by editing `WAKE_PHRASE` in `call_ollama.py`
-- You can change the transcription model size (`tiny` / `base` / `small`) by editing `WAKE_MODEL_SIZE` / `COMMAND_MODEL_SIZE`
+- You can change the model sizes (`WAKE_MODEL_SIZE` / `COMMAND_MODEL_SIZE`) in `call_ollama.py`
 - Voice support remains optional — if the required packages are not installed, the agent automatically falls back to text-only mode without errors
+
+> **Note:** `VOICE_AVAILABLE` is currently set to `False` in `call_ollama.py` to force text-only mode. Set it back to `True` (and remove the override line) to re-enable voice.
 
 ---
 
@@ -238,12 +275,16 @@ The assistant uses always-on voice activation — just say **"hello"** to wake i
 llm-desktop-agent/
 ├── core/
 │   ├── call_ollama.py      # Agent loop, conversation management, Rich rendering, voice input
-│   ├── tools.py            # All LangChain tools (27 tools)
-│   ├── file_manager.py     # File reading, indexing, tree-sitter chunking, watchdog handler
+│   ├── tools.py            # All LangChain tools (28 tools)
+│   ├── file_manager.py     # File reading/writing, markdown→docx, indexing, tree-sitter, watchdog
 │   ├── memory.py           # SQLite conversation history and semantic memory retrieval
-│   └── dashboard.py        # Textual live system monitor (launched separately)
+│   ├── ppt_agent.py        # PPT creation sub-agent: LLM XML spec → DuckDuckGo images → render
+│   ├── ppt_renderer.py     # Standalone PPTX renderer; hex palette + rich-text per element
+│   ├── dashboard.py        # Textual live system monitor (launched separately)
+│   └── diagnose_startup.py # Startup phase timer — run standalone to find slow imports
 ├── profiles/               # Saved user profiles — auto-created on first save
 ├── agent_workspace/        # Sandboxed folder the agent can read/write (on Desktop)
+│   └── _ppt_images/        # Auto-created; caches DDG images downloaded for presentations
 ├── agent_files.db          # SQLite index for workspace files and embeddings
 ├── agent_memory.db         # SQLite store for conversation history and embeddings
 ├── assets/
@@ -252,7 +293,7 @@ llm-desktop-agent/
 └── README.md
 ```
 
-The agent logic, tool definitions, file management, and memory are kept intentionally separate so components can be swapped or extended without touching the others.
+The agent logic, tool definitions, file management, memory, and presentation pipeline are kept intentionally separate so components can be swapped or extended without touching the others.
 
 ---
 
@@ -264,17 +305,21 @@ User input (typed or voice)
    Unified input queue
    (keyboard thread + voice thread)
         ↓
+   Context window tracking
+   (tiktoken token count displayed before each call)
+        ↓
    Semantic memory retrieval
    (past relevant exchanges injected into context)
         ↓
    LangChain Agent
-   + 27 tool definitions
+   + 28 tool definitions
         ↓
    LLM decides which tool(s) to call and in what order
         ↓
    Python dispatcher executes:
    pycaw / pyautogui / subprocess / sbc / psutil / win32api / win32gui
    file_manager / sqlite / watchdog / tree-sitter / ollama embeddings
+   ppt_agent → ppt_renderer (presentation pipeline)
         ↓
    Tool result returned to LLM
         ↓
@@ -342,6 +387,29 @@ Destructive commands (`del`, `format`, `reg delete`, `diskpart`, symlink creatio
 
 ---
 
+## Presentation Creation
+
+The agent has a dedicated sub-agent (`ppt_agent.py`) that generates fully-designed PowerPoint files. Just describe what you want:
+
+```
+You: make me a 7-slide presentation on machine learning
+You: create a deck on Indian Independence Day with a festive theme
+You: build a presentation on our Q3 results, save it as q3_review.pptx
+```
+
+The PPT pipeline:
+
+1. The LLM produces a `<presentation>` XML block containing a custom `<palette>` and one `<slide>` per slide
+2. Images for `image_right` slides are fetched from DuckDuckGo Images (no API key) and cached in `_ppt_images/`
+3. `ppt_renderer.py` converts the spec into a proper `.pptx` file using python-pptx
+4. The finished file is saved to `agent_workspace/` and indexed for semantic search
+
+**Available layouts:** `title` · `section` · `content` · `two_column` · `image_right` · `big_stat` · `closing`
+
+The LLM designs the palette for each topic: saffron and green for India, teal and deep navy for science, crimson and black for drama. Every heading, subheading, and bullet item can carry its own `bold`, `italic`, `size`, and `align` — the LLM controls per-element formatting, not just slide-level styles.
+
+---
+
 ## System Monitor
 
 Launch the live dashboard by asking the agent or running directly:
@@ -370,11 +438,15 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 - [✔️] Memory between sessions (SQLite-backed conversation history)
 - [✔️] File management — read, write, delete, move, search, semantic content search
 - [✔️] Wake word detection so voice activates hands-free (no hotkey hold)
+- [✔️] Voice feedback — TTS responses so the agent speaks back
+- [✔️] Web search tool — agent can search the web inline
+- [✔️] Presentation creation — full `.pptx` generation with LLM-designed palettes and DDG images
+- [✔️] Markdown → Word document writing (headings, bullets, tables via python-docx)
+- [✔️] Context window tracking — token count displayed per turn with colour-coded usage
 - [ ] Night light toggle via Windows registry
 - [ ] Resolution switching
 - [ ] System shutdown / restart / sleep commands
 - [ ] WhatsApp and other UWP app process name alias map
-- [✔️] Voice feedback — TTS responses so the agent speaks back
 - [ ] Per-app volume control (set Spotify to 40% without touching system volume)
 
 ### Medium Term
@@ -437,6 +509,8 @@ Open an issue with: OS version, Python version, Ollama model name, and the exact
 - **[faster-whisper](https://github.com/SYSTRAN/faster-whisper)** — CTranslate2-based Whisper that runs comfortably on CPU with int8 quantization.
 - **[watchdog](https://github.com/gorakhargosh/watchdog)** — clean file system event API that made the live index watcher trivial to implement.
 - **[tree-sitter](https://tree-sitter.github.io/tree-sitter/)** — language-aware AST parsing that makes code chunking genuinely semantic rather than just line-splitting.
+- **[python-pptx](https://python-pptx.readthedocs.io)** — the backbone of the PPTX generation pipeline, powering every shape, textbox, colour fill, and image embed in the presentation renderer.
+- **[tiktoken](https://github.com/openai/tiktoken)** — fast BPE tokeniser used for context window counting, so the agent can show how much of the model's context is in use before each call.
 - **[PyMuPDF](https://pymupdf.readthedocs.io)** — fast and reliable PDF text extraction.
 - **[pyautogui](https://pyautogui.readthedocs.io)** — global media key simulation that actually works.
 - **[pygetwindow](https://github.com/asweigart/PyGetWindow)** — simple and effective window management.

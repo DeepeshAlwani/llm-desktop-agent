@@ -72,6 +72,7 @@ from tools import (
     kill_process,
     list_all_saved_profiles_names,
     resize_window,
+    web_search,
     # ── file management ──────────────────────────────────────────────────────
     read_file,
     write_file,
@@ -80,7 +81,8 @@ from tools import (
     list_files,
     search_files,
     search_file_content,
-    get_workspace_tree
+    get_workspace_tree,
+    call_ppt_agent
 )
 from file_manager import (
     WATCHED_FOLDER,
@@ -111,6 +113,7 @@ agent = create_agent(
            kill_process,
            list_all_saved_profiles_names,
            resize_window,
+           web_search,
            # ── file management ──────────────────────────────────────────────
            read_file,
            write_file,
@@ -119,7 +122,8 @@ agent = create_agent(
            list_files,
            search_files,
            search_file_content,
-           get_workspace_tree
+           get_workspace_tree,
+           call_ppt_agent
            ],
     system_prompt="""You are a Windows computer control assistant.
                         IMPORTANT RULES:
@@ -167,6 +171,12 @@ agent = create_agent(
                         - Prefer named presets (left-half, right-half, top-left, etc.) over raw percentages
                         - If the user says '50% of the screen' without specifying which side, use left-half
                         - For 'side by side' requests on two apps: use left-half for the first and right-half for the second
+
+                        PRESENTATION CREATION:
+                        - Use call_ppt_agent when the user asks to make a PowerPoint, deck, or slides
+                        - Pass a detailed task string: topic, slide count, theme, desired filename
+                        - The PPT agent works autonomously — do not try to call design_slides or build_pptx yourself
+                        - When it returns, tell the user the file path and offer to open it via open_application
                             
                         **CRITICAL**:
                         - Never invent or assume information not returned by a tool
