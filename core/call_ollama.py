@@ -72,7 +72,6 @@ from tools import (
     kill_process,
     list_all_saved_profiles_names,
     resize_window,
-    web_search,
     # ── file management ──────────────────────────────────────────────────────
     read_file,
     write_file,
@@ -81,15 +80,18 @@ from tools import (
     list_files,
     search_files,
     search_file_content,
-    get_workspace_tree,
-    call_ppt_agent
+    web_search,
+    call_ppt_agent,
+    WATCHED_FOLDER
 )
+
 from file_manager import (
-    WATCHED_FOLDER,
     AgentFileHandler,
     init_file_db,
 )
+
 from watchdog.observers import Observer
+
 
 agent = create_agent(
     model="ollama:granite4.1:8b",
@@ -122,7 +124,6 @@ agent = create_agent(
            list_files,
            search_files,
            search_file_content,
-           get_workspace_tree,
            call_ppt_agent
            ],
     system_prompt="""You are a Windows computer control assistant.
@@ -563,10 +564,9 @@ if TTS_AVAILABLE:
 memory.init_db()
 
 # ── File system watcher — keeps the index in sync automatically ───────────────
-import time
-t0 = time.time()
+
 init_file_db()
-print(f"init_file_db took {time.time()-t0:.2f}s")
+
 _file_observer = Observer()
 _file_observer.schedule(AgentFileHandler(), WATCHED_FOLDER, recursive=True)
 _file_observer.start()

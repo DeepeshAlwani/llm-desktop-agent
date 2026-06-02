@@ -17,8 +17,10 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 
 
+WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agentWATCHED_FOLDER")
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent_files.db")
-WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agent_workspace")
+
 
 def add_formatted_runs(paragraph, text):
     """

@@ -1,433 +1,290 @@
 """
 ppt_agent.py  —  PPT creation sub-agent.
-Called by tools.py  →  run_ppt_agent(task: str) -> str
+Called by tools.py via run_ppt_agent(task, ask_callback).
 
-What this module owns:
-  • SYSTEM_PROMPT  – teaches the LLM the full XML schema
-  • XML parser     – extracts palette + rich-text slides from LLM output
-  • DDG image fetch – searches DuckDuckGo Images, downloads & caches locally
-  • Orchestration  – LLM call → parse → fetch images → render → index
+Flow:
+  1. Load ppt_knowledge.md into session context (once per job)
+  2. Clarification loop — ask the main agent (→ user) until confident
+  3. Design + drawing instruction generation — full LLM control
+  4. Parse XML drawing instructions → slides_data list
+  5. render_pptx() → .pptx file
+  6. index_file() via file_manager
 
-Dependency chain (nothing crosses these lines):
-  ppt_agent.py   →  ppt_renderer.py   (render_pptx)
-  ppt_agent.py   →  file_manager.py   (WATCHED_FOLDER, index_file)
-  ppt_renderer.py  never imports ppt_agent.py
-  file_manager.py  never imports either
+Session memory lives in a plain list of dicts (messages).
+No long-term storage. Cleared on each new run_ppt_agent() call.
+
+The LLM decides: colors, fonts, sizes, positions, layout structure, content.
+The renderer only draws what it's told and fixes contrast violations.
 """
 
-from __future__ import annotations
-import json
 import os
 import re
-import time
-import urllib.parse
-import urllib.request
-
+import json
+from pathlib import Path
 from langchain_ollama import ChatOllama
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from file_manager import WATCHED_FOLDER, index_file
 from ppt_renderer import render_pptx
 
-# ---------------------------------------------------------------------------
-# Image cache
-# ---------------------------------------------------------------------------
-IMAGES_DIR = os.path.join(WATCHED_FOLDER, "_ppt_images")
-os.makedirs(IMAGES_DIR, exist_ok=True)
+# ── Knowledge doc path ────────────────────────────────────────────────────────
+_HERE = Path(__file__).parent
+KNOWLEDGE_PATH = _HERE / "ppt_knowledge.md"
 
 
-# ---------------------------------------------------------------------------
-# DuckDuckGo image search  (stdlib only — no new pip deps)
-# ---------------------------------------------------------------------------
-
-def _ddg_image_urls(query: str, max_results: int = 6) -> list[str]:
-    """
-    Return up to *max_results* direct image URLs from DDG Images.
-    Uses DDG's unofficial JSON endpoint – no API key needed.
-    Returns [] on any failure.
-    """
-    headers = {"User-Agent": "Mozilla/5.0"}
+def _load_knowledge() -> str:
     try:
-        # Step 1 – get the vqd token DDG requires
-        safe_q    = urllib.parse.quote(query)
-        token_url = f"https://duckduckgo.com/?q={safe_q}&iax=images&ia=images"
-        req = urllib.request.Request(token_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as r:
-            html = r.read().decode("utf-8", errors="ignore")
-        m = re.search(r"vqd=([\d-]+)", html)
-        if not m:
-            return []
-        vqd = m.group(1)
-
-        # Step 2 – call the image API
-        api = (
-            f"https://duckduckgo.com/i.js"
-            f"?q={safe_q}&vqd={vqd}&p=1&f=,,,,,"
-        )
-        req2 = urllib.request.Request(api, headers=headers)
-        with urllib.request.urlopen(req2, timeout=8) as r2:
-            data = json.loads(r2.read().decode("utf-8", errors="ignore"))
-
-        return [
-            item["image"]
-            for item in data.get("results", [])
-            if item.get("image", "").startswith("http")
-        ][:max_results]
-
-    except Exception as exc:
-        print(f"[ppt_agent] DDG image search failed for '{query}': {exc}")
-        return []
+        return KNOWLEDGE_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return "(knowledge doc not found — use best judgment)"
 
 
-def _download(url: str, dest: str) -> bool:
-    """Download *url* → *dest*. Returns True on success."""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = r.read()
-        if len(data) < 1_000:          # reject tiny / broken responses
-            return False
-        with open(dest, "wb") as f:
-            f.write(data)
-        return True
-    except Exception as exc:
-        print(f"[ppt_agent] Download failed ({url}): {exc}")
-        return False
+# ── System prompt ─────────────────────────────────────────────────────────────
 
+def _build_system_prompt(knowledge: str, original_task: str) -> str:
+    return f"""You are a presentation designer. Your only reference is the handbook below.
+Read it carefully before every response — it contains everything you need to make
+design decisions.
 
-def fetch_image(query: str, slide_index: int) -> str | None:
-    """
-    Search DDG for *query*, download the first working result to IMAGES_DIR,
-    return the absolute local path.  Returns None if nothing works.
-    """
-    urls = _ddg_image_urls(query)
-    slug = re.sub(r"[^a-z0-9]+", "_", query.lower())[:40]
-    for url in urls:
-        ext = next((e for e in (".png", ".jpg", ".jpeg", ".webp")
-                    if e in url.lower()), ".jpg")
-        dest = os.path.join(IMAGES_DIR, f"s{slide_index}_{slug}{ext}")
-        if _download(url, dest):
-            print(f"[ppt_agent] Image saved → {dest}")
-            return dest
-        time.sleep(0.25)
-    print(f"[ppt_agent] No image found for '{query}'")
-    return None
+{knowledge}
 
+---
 
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
+ORIGINAL TASK (never forget this, it is fixed for the entire session):
+"{original_task}"
 
-SYSTEM_PROMPT = """You are a presentation designer and content writer.
-Given a topic, output ONLY a single XML block — no prose, no explanation,
-no markdown fences.  The block must be a valid <presentation>…</presentation>.
+BEHAVIOR
+========
 
-════════════════════════════════════════════════════════════
-PART 1 — PALETTE
-════════════════════════════════════════════════════════════
-Invent a colour palette that fits the topic's mood, culture, or brand.
+Ask questions one at a time until you are confident you understand the topic,
+audience, and purpose of the ORIGINAL TASK well enough to make every design
+decision yourself. Your questions must always be relevant to the ORIGINAL TASK
+above — do not drift to other topics.
 
-<palette>
-  <bg>#1C1C1C</bg>               <!-- main slide background -->
-  <bg_card>#2A2A2A</bg_card>     <!-- panel / card fill -->
-  <primary>#F2F2F2</primary>     <!-- dominant accent: stripes, headers -->
-  <secondary>#888888</secondary> <!-- secondary accent: dividers, col-headers -->
-  <accent>#FFD700</accent>       <!-- highlight / stat value colour -->
-  <text_h>#FFFFFF</text_h>       <!-- heading text -->
-  <text_b>#E0E0E0</text_b>       <!-- body / bullet text -->
-  <text_m>#AAAAAA</text_m>       <!-- muted / label text -->
-  <font_heading>Trebuchet MS</font_heading>
-  <font_body>Calibri</font_body>
-</palette>
+Output only this when asking:
 
-Mood examples:
-  India / festival   → saffron primary #FF941F, green secondary #046A38, dark navy bg
-  Ocean / science    → teal primary #02C39A, deep blue bg #065A82
-  Corporate light    → white bg #FFFFFF, navy primary #1E2761, steel accent #4A90D9
-  Dark drama         → near-black bg #0D0D0D, crimson primary #990011, white text
+<question>Your single focused question here.</question>
 
-════════════════════════════════════════════════════════════
-PART 2 — SLIDES
-════════════════════════════════════════════════════════════
-Available layouts:
-  title | section | content | two_column | image_right | big_stat | closing
-
-Rules:
-  • First slide  → layout=title.   Last slide → layout=closing.
-  • 6–8 slides total.  Use at least 3 different layouts.
-  • <heading> and <subheading> accept: size="N"  bold="true|false"  italic="true|false"  align="left|center|right"
-  • <bullets> contains <item> elements.  Each <item> accepts the same attributes.
-  • big_stat    → <stat>  and  <stat_label>
-  • image_right → <image_query> (3–5 words for DDG image search)
-  • two_column  → <col_left_label>  <col_right_label>  <bullets>  <right_bullets>
-  • <pill_label> (optional, any layout) — overrides the small coloured tab label
-    e.g. "OVERVIEW" / "COMPARE" / "HIGHLIGHTS".  Write something topic-specific.
-
-════════════════════════════════════════════════════════════
-COMPLETE EXAMPLE  (Indian Independence Day)
-════════════════════════════════════════════════════════════
+Once confident, output the full presentation and nothing else:
 
 <presentation>
-
-<palette>
-  <bg>#0D1B2A</bg>
-  <bg_card>#142A1E</bg_card>
-  <primary>#FF941F</primary>
-  <secondary>#046A38</secondary>
-  <accent>#FFC85E</accent>
-  <text_h>#FFFFFF</text_h>
-  <text_b>#E8F0E0</text_b>
-  <text_m>#FFC85E</text_m>
-  <font_heading>Trebuchet MS</font_heading>
-  <font_body>Calibri</font_body>
-</palette>
-
-<slide>
-  <layout>title</layout>
-  <heading size="52">Indian Independence Day</heading>
-  <subheading italic="true">15 August 1947 — A Nation Reborn</subheading>
-</slide>
-
-<slide>
-  <layout>big_stat</layout>
-  <heading>A Historic Moment</heading>
-  <stat>1947</stat>
-  <stat_label>Year India gained independence</stat_label>
-</slide>
-
-<slide>
-  <layout>content</layout>
-  <pill_label>TIMELINE</pill_label>
-  <heading>Road to Freedom</heading>
-  <bullets>
-    <item bold="true">1857 — First War of Independence</item>
-    <item>1885 — Indian National Congress founded</item>
-    <item>1930 — Salt March led by Mahatma Gandhi</item>
-    <item>1942 — Quit India Movement launched</item>
-    <item bold="true" italic="true">1947 — Independence on 15 August</item>
-  </bullets>
-</slide>
-
-<slide>
-  <layout>two_column</layout>
-  <pill_label>KEY FIGURES</pill_label>
-  <heading>Leaders of Independence</heading>
-  <col_left_label>Political Leaders</col_left_label>
-  <col_right_label>Social Reformers</col_right_label>
-  <bullets>
-    <item>Jawaharlal Nehru — First Prime Minister</item>
-    <item>Sardar Patel — Iron Man of India</item>
-    <item>Subhas Chandra Bose — INA founder</item>
-  </bullets>
-  <right_bullets>
-    <item>Mahatma Gandhi — Father of Nation</item>
-    <item>B.R. Ambedkar — Constitution architect</item>
-    <item>Sarojini Naidu — Nightingale of India</item>
-  </right_bullets>
-</slide>
-
-<slide>
-  <layout>image_right</layout>
-  <pill_label>SYMBOL</pill_label>
-  <heading>The Tricolour Flag</heading>
-  <bullets>
-    <item bold="true">Saffron — courage and sacrifice</item>
-    <item>White — peace and truth</item>
-    <item bold="true">Green — faith and prosperity</item>
-    <item italic="true">Ashoka Chakra — wheel of law</item>
-  </bullets>
-  <image_query>Indian flag tricolour independence</image_query>
-</slide>
-
-<slide>
-  <layout>section</layout>
-  <heading>Celebrations Across India</heading>
-  <subheading>Flag hoisting · Parades · Cultural events</subheading>
-</slide>
-
-<slide>
-  <layout>closing</layout>
-  <heading>Jai Hind!</heading>
-  <subheading italic="true">At the stroke of the midnight hour, India awoke to life and freedom.</subheading>
-  <bullets>
-    <item>77 years of democracy and progress</item>
-    <item>Unity in diversity — our greatest strength</item>
-  </bullets>
-</slide>
-
+<slide bg="#hex"> ... </slide>
 </presentation>
 
-Now write the complete XML for the topic the user gives you.
-Output ONLY the <presentation>…</presentation> block, nothing else."""
+OUTPUT RULES (the renderer is strict):
+- Every attribute value must be quoted.
+- items= must be a valid JSON array: '["point one","point two"]'
+- Use &amp; instead of & inside any attribute value.
+- Draw rects before text on every slide (background first, content on top).
+- No prose, no explanation — only the tags.
+"""
 
 
-# ---------------------------------------------------------------------------
-# XML parser
-# ---------------------------------------------------------------------------
+# ── XML parser ────────────────────────────────────────────────────────────────
 
-def _inner(block: str, tag: str) -> str:
-    """Return inner text of first <tag>…</tag> match (strips whitespace)."""
-    m = re.search(rf"<{tag}(?:[^>]*)>(.*?)</{tag}>", block, re.DOTALL)
-    return m.group(1).strip() if m else ""
+def _attr(tag_str: str, name: str, default: str = "") -> str:
+    """Extract a named attribute value from an XML tag string."""
+    m = re.search(rf'{name}\s*=\s*"([^"]*)"', tag_str)
+    return m.group(1) if m else default
 
 
-def _attr(open_tag: str, attr: str, default: str = "") -> str:
-    m = re.search(rf'{attr}="([^"]*)"', open_tag)
-    return m.group(1).strip() if m else default
-
-
-def _parse_rich(block: str, tag: str) -> dict | None:
+def parse_presentation(raw: str) -> list[dict]:
     """
-    Parse  <tag [attrs]>text</tag>  →
-    {"text": str, "bold": bool, "italic": bool, "size": int|None, "align": str}
-    Returns None if the tag is absent.
+    Parse <presentation>...</presentation> XML output from the LLM
+    into a list of slide dicts ready for render_pptx().
     """
-    m = re.search(rf"(<{tag}(?:[^>]*)>)(.*?)</{tag}>", block, re.DOTALL)
-    if not m:
-        return None
-    open_tag, text = m.group(1), m.group(2).strip()
-    return {
-        "text":   text,
-        "bold":   _attr(open_tag, "bold",   "false").lower() == "true",
-        "italic": _attr(open_tag, "italic", "false").lower() == "true",
-        "size":   int(_attr(open_tag, "size", "0") or "0") or None,
-        "align":  _attr(open_tag, "align", "left"),
-    }
-
-
-def _parse_items(block: str, list_tag: str) -> list[dict]:
-    """
-    Parse  <list_tag><item [attrs]>text</item>…</list_tag>
-    → list of rich-text dicts.
-    """
-    raw = _inner(block, list_tag)
-    if not raw:
+    pres_m = re.search(r"<presentation>(.*?)</presentation>", raw, re.DOTALL)
+    if not pres_m:
         return []
-    out = []
-    for m in re.finditer(r"(<item(?:[^>]*)>)(.*?)</item>", raw, re.DOTALL):
-        open_tag, text = m.group(1), m.group(2).strip()
-        out.append({
-            "text":   text,
-            "bold":   _attr(open_tag, "bold",   "false").lower() == "true",
-            "italic": _attr(open_tag, "italic", "false").lower() == "true",
-            "size":   int(_attr(open_tag, "size", "0") or "0") or None,
-            "align":  _attr(open_tag, "align", "left"),
-        })
-    return out
+
+    slides_data = []
+    slide_blocks = re.split(r"<slide\b", pres_m.group(1))[1:]
+
+    for block in slide_blocks:
+        bg_m = re.search(r'bg\s*=\s*"([^"]*)"', block)
+        bg   = bg_m.group(1) if bg_m else "#1C1C1C"
+
+        body     = block.split("</slide>")[0]
+        elements = []
+
+        for el_m in re.finditer(r"<element\b([^/]*?)/>", body, re.DOTALL):
+            tag = el_m.group(1)
+            el_type = _attr(tag, "type")
+            if not el_type:
+                continue
+
+            el: dict = {"type": el_type}
+
+            for dim in ("l", "t", "w", "h"):
+                v = _attr(tag, dim)
+                if v:
+                    try:
+                        el[dim] = float(v)
+                    except ValueError:
+                        el[dim] = 0.0
+
+            if el_type == "rect":
+                el["color"]        = _attr(tag, "color", "#888888")
+                bc = _attr(tag, "border_color")
+                if bc:
+                    el["border_color"] = bc
+
+            elif el_type == "text":
+                el["text"]   = _attr(tag, "text").replace("&amp;", "&")
+                el["size"]   = float(_attr(tag, "size",  "18"))
+                el["bold"]   = _attr(tag, "bold",   "false").lower() == "true"
+                el["italic"] = _attr(tag, "italic", "false").lower() == "true"
+                el["color"]  = _attr(tag, "color",  "#FFFFFF")
+                el["align"]  = _attr(tag, "align",  "left")
+                el["font"]   = _attr(tag, "font",   "Calibri")
+
+            elif el_type == "bullets":
+                raw_items = _attr(tag, "items", "[]").replace("&amp;", "&")
+                try:
+                    items = json.loads(raw_items)
+                except Exception:
+                    inner = raw_items.strip().strip("[]")
+                    items = [i.strip().strip('"').strip("'")
+                             for i in inner.split('","') if i.strip()]
+                el["items"]        = items
+                el["size"]         = float(_attr(tag, "size",         "16"))
+                el["bold"]         = _attr(tag, "bold",   "false").lower() == "true"
+                el["italic"]       = _attr(tag, "italic", "false").lower() == "true"
+                el["color"]        = _attr(tag, "color",  "#FFFFFF")
+                el["font"]         = _attr(tag, "font",   "Calibri")
+                el["marker"]       = _attr(tag, "marker", "▸  ")
+                el["space_before"] = float(_attr(tag, "space_before", "7"))
+
+            elif el_type == "image":
+                el["image_query"] = _attr(tag, "image_query", "abstract background")
+
+            elements.append(el)
+
+        slides_data.append({"bg": bg, "elements": elements})
+
+    return slides_data
 
 
-def _parse_palette(body: str) -> dict:
+def extract_question(raw: str) -> str | None:
+    """Return the clarifying question text if the LLM is still in Phase 1."""
+    m = re.search(r"<question>(.*?)</question>", raw, re.DOTALL)
+    return m.group(1).strip() if m else None
+
+
+# ── Session memory ────────────────────────────────────────────────────────────
+
+class SessionMemory:
+    """Simple in-process message history for one PPT job."""
+
+    def __init__(self, system_prompt: str):
+        self._system = system_prompt
+        self._history: list[dict] = []
+
+    def add_user(self, text: str):
+        self._history.append({"role": "user", "content": text})
+
+    def add_assistant(self, text: str):
+        self._history.append({"role": "assistant", "content": text})
+
+    def messages(self) -> list:
+        """
+        Return as a list of LangChain message objects.
+
+        FIX: Previously returned (role, content) tuples which ChatOllama
+        cannot reliably parse — causing context loss and topic drift.
+        Now returns proper BaseMessage objects that ChatOllama always
+        interprets correctly.
+        """
+        msgs = [SystemMessage(content=self._system)]
+        for m in self._history:
+            if m["role"] == "user":
+                msgs.append(HumanMessage(content=m["content"]))
+            else:
+                msgs.append(AIMessage(content=m["content"]))
+        return msgs
+
+    def summary(self) -> str:
+        return "\n".join(
+            f"[{m['role'].upper()}] {m['content'][:120]}"
+            for m in self._history
+        )
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def run_ppt_agent(task: str, ask_callback) -> str:
     """
-    Extract <palette> hex/font values.
-    Every missing key falls back to a dark charcoal default.
+    Main entry point called by tools.py.
+
+    Args:
+        task:          Natural language request from the user/main agent.
+        ask_callback:  Callable(question: str) -> str
+                       The main agent calls this to relay a clarifying
+                       question to the user and return the answer.
+                       Signature: answer = ask_callback(question_text)
+
+    Returns:
+        "Saved N slides → /path/…"   on success
+        "Error: …"                   on failure
     """
-    defaults = {
-        "bg": "#1C1C1C", "bg_card": "#2A2A2A",
-        "primary": "#F2F2F2", "secondary": "#888888",
-        "accent": "#FFD700",
-        "text_h": "#FFFFFF", "text_b": "#E0E0E0", "text_m": "#AAAAAA",
-        "font_heading": "Trebuchet MS", "font_body": "Calibri",
-    }
-    pal_block = _inner(body, "palette")
-    if not pal_block:
-        return defaults.copy()
-    result = {}
-    for k in defaults:
-        result[k] = _inner(pal_block, k) or defaults[k]
-    return result
 
+    knowledge = _load_knowledge()
+    # FIX: Pass original task into the system prompt so the LLM always
+    # has an immutable anchor even if its conversation context degrades.
+    system    = _build_system_prompt(knowledge, original_task=task)
+    memory    = SessionMemory(system)
+    llm       = ChatOllama(model="granite4.1:8b", temperature=0.4)
 
-def parse_response(raw: str) -> tuple[dict, list[dict]]:
-    """
-    Parse the LLM's XML output.
-    Returns  (palette_dict,  slides_list).
-    palette_dict  → hex strings; converted to RGBColor inside ppt_renderer.
-    slides_list   → list of slide dicts with rich-text nodes.
-    """
-    # Unwrap <presentation> if present
-    pm   = re.search(r"<presentation>(.*?)</presentation>", raw, re.DOTALL)
-    body = pm.group(1) if pm else raw
+    # Seed the conversation with the original task
+    memory.add_user(task)
 
-    palette = _parse_palette(body)
-    slides  = []
+    MAX_CLARIFICATION_ROUNDS = 3   # FIX: Reduced from 6 — fewer questions,
+                                   # less chance of context drift.
+    round_count = 0
 
-    for block in re.split(r"<slide>", body)[1:]:
-        sb = block.split("</slide>")[0]
+    while True:
+        response   = llm.invoke(memory.messages())
+        raw        = response.content
+        print(f"[ppt_agent] Round {round_count} response (first 300 chars):\n{raw[:300]}\n")
 
-        layout  = _inner(sb, "layout")
-        heading = _parse_rich(sb, "heading")
-        if not layout or not heading:
+        memory.add_assistant(raw)
+
+        # ── Phase 1: clarification ─────────────────────────────────────────
+        question = extract_question(raw)
+        if question and round_count < MAX_CLARIFICATION_ROUNDS:
+            print(f"[ppt_agent] Asking: {question}")
+            answer = ask_callback(question)
+            print(f"[ppt_agent] Answer: {answer}")
+            memory.add_user(answer)
+            round_count += 1
             continue
 
-        slide: dict = {"layout": layout, "heading": heading}
+        # ── Phase 2: presentation output ───────────────────────────────────
+        slides_data = parse_presentation(raw)
 
-        sub = _parse_rich(sb, "subheading")
-        if sub:
-            slide["subheading"] = sub
+        if not slides_data:
+            if round_count < MAX_CLARIFICATION_ROUNDS + 1:
+                # FIX: Explicit nudge that references the original topic,
+                # preventing the model from inventing a new subject.
+                memory.add_user(
+                    f"You have enough information. Please now create the full "
+                    f"presentation about '{task}' using the "
+                    f"<presentation>...</presentation> format from your instructions. "
+                    f"Do not ask any more questions."
+                )
+                round_count += 1
+                continue
+            else:
+                return (
+                    f"ERROR: Agent did not produce a presentation after "
+                    f"{round_count} rounds.\n\nLast output:\n{raw[:500]}"
+                )
 
-        pill = _inner(sb, "pill_label")
-        if pill:
-            slide["pill_label"] = pill
+        break
 
-        bullets = _parse_items(sb, "bullets")
-        if bullets:
-            slide["bullets"] = bullets
+    print(f"[ppt_agent] Parsed {len(slides_data)} slides.")
 
-        if layout == "two_column":
-            slide["col_left_label"]  = _inner(sb, "col_left_label")
-            slide["col_right_label"] = _inner(sb, "col_right_label")
-            rb = _parse_items(sb, "right_bullets")
-            if rb:
-                slide["right_bullets"] = rb
-
-        if layout == "big_stat":
-            slide["stat"]       = _inner(sb, "stat")
-            slide["stat_label"] = _inner(sb, "stat_label")
-
-        if layout == "image_right":
-            slide["image_query"] = _inner(sb, "image_query") or heading["text"]
-
-        slides.append(slide)
-
-    return palette, slides
-
-
-# ---------------------------------------------------------------------------
-# Entry point  (called by tools.py → call_ppt_agent)
-# ---------------------------------------------------------------------------
-
-def run_ppt_agent(task: str) -> str:
-    """
-    1. Ask the LLM to produce the full XML spec (palette + slides).
-    2. Parse palette (hex strings) and slides (rich-text dicts).
-    3. Fetch images via DuckDuckGo; save to IMAGES_DIR.
-    4. Render via ppt_renderer.render_pptx.
-    5. Index the file via file_manager.index_file.
-    Returns a status string.
-    """
-    print(f"[ppt_agent] Task: {task}")
-
-    llm      = ChatOllama(model="granite4.1:8b", temperature=0.3)
-    response = llm.invoke([("system", SYSTEM_PROMPT), ("human", task)])
-    raw      = response.content
-    print(f"[ppt_agent] Raw output:\n{raw}\n")
-
-    palette, slides = parse_response(raw)
-    print(f"[ppt_agent] Palette: {palette}")
-    print(f"[ppt_agent] Slides: {len(slides)}")
-
-    if not slides:
-        return f"ERROR: Could not parse any slides.\n\nRaw output:\n{raw}"
-
-    # ── Fetch images for image_right slides ───────────────────────────────────
-    images: dict[str, str] = {}     # { image_query: local_abs_path }
-    for i, s in enumerate(slides):
-        if s.get("layout") == "image_right":
-            q    = s["image_query"]
-            path = fetch_image(q, i)
-            if path:
-                images[q] = path
-
-    # ── Build output path ─────────────────────────────────────────────────────
+    # Build output path
     slug     = re.sub(r"[^a-z0-9]+", "_", task.lower())[:40].strip("_")
     filename = f"{slug}.pptx"
     abs_path = os.path.abspath(os.path.join(WATCHED_FOLDER, filename))
@@ -435,20 +292,28 @@ def run_ppt_agent(task: str) -> str:
     if not abs_path.startswith(os.path.abspath(WATCHED_FOLDER)):
         return "Error: output path is outside the workspace."
 
-    spec   = {"slides": slides, "_images": images}
-    result = render_pptx(abs_path, spec, palette=palette)
-    print(f"[ppt_agent] render_pptx → {result}")
+    result = render_pptx(abs_path, slides_data)
 
-    if result.startswith("Saved"):
-        index_file(abs_path)
+    if result.get("warnings"):
+        print(f"[ppt_agent] Renderer warnings:\n" +
+              "\n".join(f"  {w}" for w in result["warnings"]))
 
-    return result
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+
+    index_file(abs_path)
+    return f"Saved {result['slides']} slides → {abs_path}"
 
 
-# ---------------------------------------------------------------------------
-# Quick smoke-test
-# ---------------------------------------------------------------------------
+# ── Standalone test ───────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    print(run_ppt_agent(
-        "create a presentation on How to use POWERBI"
-    ))
+    def cli_callback(question: str) -> str:
+        print(f"\n[AGENT ASKS] {question}")
+        return input("Your answer: ").strip()
+
+    out = run_ppt_agent(
+        "please create me a presentation on transformers for my school project",
+        ask_callback=cli_callback
+    )
+    print(f"\nFinal output: {out}")

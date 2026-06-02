@@ -23,7 +23,6 @@ from ppt_agent import run_ppt_agent
 import shutil as _shutil
 import numpy as _np
 from file_manager import (
-    WATCHED_FOLDER as _WORKSPACE,
     read_file_content,
     index_file,
     remove_file_from_index,
@@ -41,7 +40,7 @@ import re
 import shlex
 
 PROFILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "profiles")
-WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agent_workspace")
+WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agentWATCHED_FOLDER")
 
 BLOCKED_PATTERNS = [
     r"\bdel\b", r"\brd\b", r"\brmdir\b",
@@ -111,8 +110,7 @@ def _run_command(command: str, timeout: int = 15) -> str:
         return "Command timed out after 15 seconds"
     except Exception as e:
         return f"Failed to run command: {e}"
-
-
+        
 @tool("web_search", description="""Search the internet for current information.
 Use for news, recent events, live data, or anything that may have changed since training.
 Always cite the source URLs in your reply.""")
@@ -141,7 +139,6 @@ def web_search(query: str, max_results: int = 5) -> str:
         lines.append(f"   Source: {r.get('href', '')}\n")
     return "\n".join(lines)
 
-
 @tool("call_ppt_agent", description="""Delegate PowerPoint creation to the dedicated PPT sub-agent.
 Use whenever the user asks to make a PowerPoint, create a deck, or build slides about any topic.
  
@@ -162,12 +159,12 @@ Example call:
  
 Returns the saved file path on success, or an error string on failure.
 After success, offer to open the file with open_application.""")
-def call_ppt_agent(task: str) -> str:
+def call_ppt_agent(task: str, ask_callback) -> str:
     """
     Args:
         task: Full natural-language description of the desired presentation.
     """
-    return run_ppt_agent(task)
+    return run_ppt_agent(task, ask_callback)
 
 @tool("query_system", description="""Run a read-only system query command in cmd. 
 Use for checking system info, network status, running processes, installed software, 
@@ -876,7 +873,7 @@ def resize_window(
 
 def _safe_path(user_path: str) -> "tuple[str, str | None]":
     """Resolve a workspace-relative path; block path traversal."""
-    base = os.path.abspath(_WORKSPACE)
+    base = os.path.abspath(WATCHED_FOLDER)
     resolved = os.path.abspath(os.path.join(base, user_path))
     if not resolved.startswith(base + os.sep) and resolved != base:
         return "", f"Access denied: '{user_path}' is outside the workspace."
@@ -1002,7 +999,7 @@ def list_files(subfolder: str = "") -> str:
         if err:
             return err
     else:
-        abs_path = os.path.abspath(_WORKSPACE)
+        abs_path = os.path.abspath(WATCHED_FOLDER)
 
     if not os.path.isdir(abs_path):
         return f"Not a directory: '{subfolder}'"
@@ -1030,7 +1027,7 @@ def search_files(query: str) -> str:
     Args:
         query: filename fragment or extension to match, e.g. 'report' or '.py'
     """
-    base = os.path.abspath(_WORKSPACE)
+    base = os.path.abspath(WATCHED_FOLDER)
     matches = []
     for root, dirs, files in os.walk(base):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
@@ -1067,7 +1064,7 @@ def search_file_content(query: str, top_k: int = 5) -> str:
         if not rows:
             return "No files have been indexed yet. Try reading or writing a file first."
 
-        base = os.path.abspath(_WORKSPACE)
+        base = os.path.abspath(WATCHED_FOLDER)
         scored = []
         for content, emb_bytes, filepath in rows:
             if emb_bytes is None:
@@ -1086,17 +1083,17 @@ def search_file_content(query: str, top_k: int = 5) -> str:
     except Exception as e:
         return f"Search failed: {e}"
     
-@tool("get_workspace_tree", description="""Show the full recursive folder/file tree of the agent workspace.
+@tool("getWATCHED_FOLDER_tree", description="""Show the full recursive folder/file tree of the agent workspace.
 Use when the user says 'show me the folder structure', 'what does the workspace look like',
 'give me an overview of the files', or before doing complex file operations so you understand
 the layout. Returns an indented tree with file sizes.""")
-def get_workspace_tree(subfolder: str = "", max_depth: int = 6) -> str:
+def getWATCHED_FOLDER_tree(subfolder: str = "", max_depth: int = 6) -> str:
     """
     Args:
         subfolder: subfolder to root the tree at (empty = whole workspace)
         max_depth: how many levels deep to recurse (default 6)
     """
-    base = os.path.abspath(_WORKSPACE)
+    base = os.path.abspath(WATCHED_FOLDER)
     if subfolder:
         root = os.path.abspath(os.path.join(base, subfolder))
         if not root.startswith(base):

@@ -1,32 +1,31 @@
 """
-ppt_renderer.py  —  standalone PPTX renderer for ppt_agent.py.
+ppt_renderer.py  —  pure drawing executor for ppt_agent.py.
 
-What changed from the original:
-  • Palette is now a dict of raw hex strings passed in by the LLM.
-    No fixed PALETTES registry.  _build_pal() converts hex → RGBColor.
-  • Text nodes are dicts  {text, bold, italic, size, align}  so every
-    drawn element respects the LLM's per-element formatting choices.
-  • Bullet items carry the same rich-text attributes.
-  • pill_label per slide overrides hardcoded "OVERVIEW" / "COMPARE" etc.
-  • Images are local file paths (saved by ppt_agent) — not bytes blobs.
+Responsibilities:
+  - Validate contrast of every text/background pair (auto-fixes below 3.0)
+  - Execute drawing instructions exactly as given by the agent
+  - Fetch/embed images by query string
 
-This module NEVER imports ppt_agent or file_manager.
+What this module does NOT do:
+  - Choose colors, fonts, layouts, content — the agent decides all of that
+  - Apply design defaults beyond what the agent specifies
+  - Know anything about palettes, themes, or slide purposes
+
+Never imports ppt_agent or file_manager.
 """
 
 from __future__ import annotations
-import os
+import io, os
+import requests
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 
 
-# ---------------------------------------------------------------------------
-# Colour helpers
-# ---------------------------------------------------------------------------
+# ── Colour helpers ────────────────────────────────────────────────────────────
 
-def _hex(h: str) -> RGBColor:
-    """'#RRGGBB'  or  'RRGGBB'  →  RGBColor.  Falls back to white."""
+def _rgb(h: str) -> RGBColor:
     try:
         h = h.strip().lstrip("#")
         return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
@@ -34,28 +33,48 @@ def _hex(h: str) -> RGBColor:
         return RGBColor(0xFF, 0xFF, 0xFF)
 
 
-def _build_pal(raw: dict) -> dict:
-    """Convert a dict of hex strings → a dict of RGBColor objects + font names."""
-    colour_keys = ["bg", "bg_card", "primary", "secondary", "accent",
-                   "text_h", "text_b", "text_m"]
-    pal = {k: _hex(raw.get(k, "#FFFFFF")) for k in colour_keys}
-    pal["font_heading"] = raw.get("font_heading", "Trebuchet MS")
-    pal["font_body"]    = raw.get("font_body",    "Calibri")
-    return pal
+def _luminance(h: str) -> float:
+    try:
+        h = h.strip().lstrip("#")
+        vals = [int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
+        def lin(c):
+            return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+        r, g, b = [lin(v) for v in vals]
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    except Exception:
+        return 1.0
 
 
-# ---------------------------------------------------------------------------
-# Slide / shape helpers
-# ---------------------------------------------------------------------------
+def contrast_ratio(fg: str, bg: str) -> float:
+    l1, l2 = _luminance(fg), _luminance(bg)
+    lighter, darker = max(l1, l2), min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+# ── Image fetching ────────────────────────────────────────────────────────────
+
+def fetch_image(query: str) -> io.BytesIO | None:
+    try:
+        url = f"https://source.unsplash.com/560x420/?{query.replace(' ', ',')}"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200 and r.content:
+            return io.BytesIO(r.content)
+    except Exception:
+        pass
+    try:
+        from PIL import Image
+        img = Image.new("RGB", (560, 420), (40, 40, 60))
+        buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
+        return buf
+    except Exception:
+        return None
+
+
+# ── Canvas constants ──────────────────────────────────────────────────────────
 
 SW = Inches(13.33)
 SH = Inches(7.5)
-
-_ALIGN = {
-    "left":   PP_ALIGN.LEFT,
-    "center": PP_ALIGN.CENTER,
-    "right":  PP_ALIGN.RIGHT,
-}
+_ALIGN_MAP = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT}
 
 
 def _new_prs() -> Presentation:
@@ -64,342 +83,151 @@ def _new_prs() -> Presentation:
     prs.slide_height = SH
     return prs
 
-
-def _blank(prs: Presentation):
+def _blank(prs):
     return prs.slides.add_slide(prs.slide_layouts[6])
 
-
-def _bg(slide, color: RGBColor) -> None:
+def _set_bg(slide, color_hex: str) -> None:
     f = slide.background.fill
     f.solid()
-    f.fore_color.rgb = color
+    f.fore_color.rgb = _rgb(color_hex)
 
 
-def _rect(slide, l, t, w, h, color: RGBColor,
-          border: RGBColor | None = None):
-    sh = slide.shapes.add_shape(1, Inches(l), Inches(t), Inches(w), Inches(h))
-    sh.fill.solid()
-    sh.fill.fore_color.rgb = color
-    if border:
-        sh.line.color.rgb = border
+# ── Element drawers ───────────────────────────────────────────────────────────
+
+def _draw_rect(slide, el: dict) -> None:
+    shape = slide.shapes.add_shape(
+        1, Inches(el["l"]), Inches(el["t"]), Inches(el["w"]), Inches(el["h"])
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = _rgb(el["color"])
+    if el.get("border_color"):
+        shape.line.color.rgb = _rgb(el["border_color"])
     else:
-        sh.line.fill.background()
-    return sh
+        shape.line.fill.background()
 
 
-def _textbox(slide, l, t, w, h,
-             node,                         # str  OR  rich-text dict
-             *,
-             dsize:   float = 18,
-             dbold:   bool  = False,
-             ditalic: bool  = False,
-             dcolor:  RGBColor | None = None,
-             dalign:  str   = "left",
-             dfont:   str   = "Calibri") -> None:
-    """
-    Draw a single-paragraph textbox.
-    If *node* is a dict it may carry: text, bold, italic, size, align.
-    Any absent key falls back to the d* defaults.
-    """
-    if isinstance(node, str):
-        text, bold, italic, size, align = node, dbold, ditalic, dsize, dalign
-    else:
-        text   = node.get("text",   "")
-        bold   = node.get("bold",   dbold)
-        italic = node.get("italic", ditalic)
-        size   = node.get("size")   or dsize
-        align  = node.get("align",  dalign)
-
-    tb = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h))
+def _draw_text(slide, el: dict) -> None:
+    tb = slide.shapes.add_textbox(
+        Inches(el["l"]), Inches(el["t"]), Inches(el["w"]), Inches(el["h"])
+    )
     tf = tb.text_frame
     tf.word_wrap = True
-    p   = tf.paragraphs[0]
-    p.alignment = _ALIGN.get(align, PP_ALIGN.LEFT)
+    p = tf.paragraphs[0]
+    p.alignment = _ALIGN_MAP.get(el.get("align", "left"), PP_ALIGN.LEFT)
     run = p.add_run()
-    run.text        = text
-    run.font.size   = Pt(size)
-    run.font.bold   = bold
-    run.font.italic = italic
-    run.font.name   = dfont
-    if dcolor:
-        run.font.color.rgb = dcolor
+    run.text        = str(el.get("text", ""))
+    run.font.size   = Pt(float(el.get("size", 18)))
+    run.font.bold   = bool(el.get("bold", False))
+    run.font.italic = bool(el.get("italic", False))
+    run.font.name   = el.get("font", "Calibri")
+    run.font.color.rgb = _rgb(el.get("color", "#FFFFFF"))
 
 
-def _bullets(slide, l, t, w, h,
-             items: list,                  # list of str  OR  rich-text dicts
-             *,
-             dsize:  float = 16,
-             dcolor: RGBColor | None = None,
-             marker: str   = "▸  ",
-             dfont:  str   = "Calibri") -> None:
-    """Draw a multi-item bullet box. Each item honours its own bold/italic/size."""
-    tb = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h))
+def _draw_bullets(slide, el: dict) -> None:
+    tb = slide.shapes.add_textbox(
+        Inches(el["l"]), Inches(el["t"]), Inches(el["w"]), Inches(el["h"])
+    )
     tf = tb.text_frame
     tf.word_wrap = True
-    for i, item in enumerate(items):
-        if isinstance(item, str):
-            text, bold, italic, size = item, False, False, dsize
-        else:
-            text   = item.get("text",   "")
-            bold   = item.get("bold",   False)
-            italic = item.get("italic", False)
-            size   = item.get("size")   or dsize
-
+    marker = el.get("marker", "▸  ")
+    for i, item in enumerate(el.get("items", [])):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.space_before = Pt(7)
+        p.space_before = Pt(el.get("space_before", 7))
         p.alignment    = PP_ALIGN.LEFT
         run = p.add_run()
-        run.text        = marker + text
-        run.font.size   = Pt(size)
-        run.font.bold   = bold
-        run.font.italic = italic
-        run.font.name   = dfont
-        if dcolor:
-            run.font.color.rgb = dcolor
+        run.text        = marker + str(item)
+        run.font.size   = Pt(float(el.get("size", 16)))
+        run.font.bold   = bool(el.get("bold", False))
+        run.font.italic = bool(el.get("italic", False))
+        run.font.name   = el.get("font", "Calibri")
+        run.font.color.rgb = _rgb(el.get("color", "#FFFFFF"))
 
 
-def _pill(slide, l, t, w, h, label: str,
-          bg: RGBColor, fg: RGBColor, font: str = "Calibri") -> None:
-    _rect(slide, l, t, w, h, bg)
-    _textbox(slide, l, t, w, h, label,
-             dsize=10, dbold=True, dcolor=fg, dalign="center", dfont=font)
-
-
-# ---------------------------------------------------------------------------
-# Layout renderers
-# ---------------------------------------------------------------------------
-
-def _render_title(prs, s: dict, p: dict) -> None:
-    sl = _blank(prs)
-    _bg(sl, p["bg"])
-    _rect(sl, 0, 0,    13.33, 0.4,  p["primary"])       # top stripe
-    _rect(sl, 0, 7.1,  13.33, 0.4,  p["secondary"])     # bottom stripe
-    _rect(sl, 0.45, 0.55, 0.1, 6.0, p["primary"])       # left bar
-
-    _textbox(sl, 0.9, 1.4, 11.2, 2.5, s["heading"],
-             dsize=50, dbold=True, dcolor=p["text_h"],
-             dalign="left", dfont=p["font_heading"])
-
-    _rect(sl, 0.9, 4.05, 7.0, 0.05, p["accent"])        # gold divider
-
-    if s.get("subheading"):
-        _textbox(sl, 0.9, 4.2, 10.5, 1.2, s["subheading"],
-                 dsize=22, ditalic=True, dcolor=p["text_b"],
-                 dalign="left", dfont=p["font_body"])
-
-
-def _render_section(prs, s: dict, p: dict) -> None:
-    sl = _blank(prs)
-    _bg(sl, p["bg"])
-    _rect(sl, 0, 2.5, 13.33, 2.5, p["primary"])         # central band
-
-    if s.get("subheading"):
-        _textbox(sl, 0.8, 1.8, 11.5, 0.7, s["subheading"],
-                 dsize=13, dbold=True, dcolor=p["text_m"],
-                 dalign="center", dfont=p["font_body"])
-
-    _textbox(sl, 0.5, 2.75, 12.33, 1.8, s["heading"],
-             dsize=42, dbold=True, dcolor=p["bg"],
-             dalign="center", dfont=p["font_heading"])
-
-    if s.get("bullets"):
-        _bullets(sl, 1.0, 5.2, 11.33, 1.9, s["bullets"],
-                 dsize=15, dcolor=p["text_b"], dfont=p["font_body"])
-
-
-def _render_content(prs, s: dict, p: dict) -> None:
-    sl = _blank(prs)
-    _bg(sl, p["bg"])
-
-    label = s.get("pill_label", "OVERVIEW")
-    _pill(sl, 0.5, 0.22, 2.8, 0.42, label,
-          p["secondary"], p["text_h"], p["font_body"])
-
-    _textbox(sl, 0.5, 0.78, 12.0, 0.9, s["heading"],
-             dsize=30, dbold=True, dcolor=p["text_h"],
-             dfont=p["font_heading"])
-
-    _rect(sl, 0.5, 1.75, 12.33, 0.05, p["primary"])     # underline
-
-    if s.get("bullets"):
-        _bullets(sl, 0.65, 1.95, 12.0, 5.2, s["bullets"],
-                 dsize=17, dcolor=p["text_b"], dfont=p["font_body"])
-
-
-def _render_two_column(prs, s: dict, p: dict) -> None:
-    sl = _blank(prs)
-    _bg(sl, p["bg"])
-
-    label = s.get("pill_label", "COMPARE")
-    _pill(sl, 0.5, 0.22, 2.8, 0.42, label,
-          p["primary"], p["bg"], p["font_body"])
-
-    _textbox(sl, 0.5, 0.78, 12.0, 0.9, s["heading"],
-             dsize=30, dbold=True, dcolor=p["text_h"],
-             dfont=p["font_heading"])
-    _rect(sl, 0.5, 1.75, 12.33, 0.05, p["secondary"])
-
-    # Left column header
-    _rect(sl,  0.5, 1.92,  5.9, 0.38, p["primary"])
-    _textbox(sl, 0.5, 1.92, 5.9, 0.38,
-             s.get("col_left_label", ""),
-             dsize=12, dbold=True, dcolor=p["bg"],
-             dalign="center", dfont=p["font_body"])
-
-    # Right column header
-    _rect(sl,  6.93, 1.92, 5.9, 0.38, p["secondary"])
-    _textbox(sl, 6.93, 1.92, 5.9, 0.38,
-             s.get("col_right_label", ""),
-             dsize=12, dbold=True, dcolor=p["text_h"],
-             dalign="center", dfont=p["font_body"])
-
-    if s.get("bullets"):
-        _bullets(sl, 0.6, 2.45, 5.7, 4.7, s["bullets"],
-                 dsize=15, dcolor=p["text_b"], dfont=p["font_body"])
-    if s.get("right_bullets"):
-        _bullets(sl, 7.0, 2.45, 5.7, 4.7, s["right_bullets"],
-                 dsize=15, dcolor=p["text_b"], dfont=p["font_body"])
-
-    _rect(sl, 6.6, 1.85, 0.04, 5.4, p["accent"])        # vertical divider
-
-
-def _render_image_right(prs, s: dict, p: dict, images: dict) -> None:
-    sl = _blank(prs)
-    _bg(sl, p["bg"])
-
-    label = s.get("pill_label", "HIGHLIGHTS")
-    _pill(sl, 0.5, 0.22, 2.8, 0.42, label,
-          p["secondary"], p["text_h"], p["font_body"])
-
-    _textbox(sl, 0.5, 0.78, 7.2, 0.9, s["heading"],
-             dsize=28, dbold=True, dcolor=p["text_h"],
-             dfont=p["font_heading"])
-    _rect(sl, 0.5, 1.75, 7.0, 0.05, p["primary"])
-
-    if s.get("bullets"):
-        _bullets(sl, 0.6, 1.95, 6.9, 4.8, s["bullets"],
-                 dsize=16, dcolor=p["text_b"], dfont=p["font_body"])
-
-    # Right image panel
-    query    = s.get("image_query", "")
-    img_path = images.get(query, "")
-    if img_path and os.path.isfile(img_path):
+def _draw_image(slide, el: dict) -> None:
+    buf = fetch_image(el.get("image_query", "abstract"))
+    if buf:
         try:
-            sl.shapes.add_picture(
-                img_path, Inches(7.95), Inches(0.9), Inches(5.0), Inches(6.2)
+            slide.shapes.add_picture(
+                buf, Inches(el["l"]), Inches(el["t"]),
+                Inches(el["w"]), Inches(el["h"])
             )
             return
-        except Exception as exc:
+        except Exception:
             pass
-
-    # Fallback placeholder
-    _rect(sl, 7.95, 0.9, 5.0, 6.2, p["bg_card"])
-    _textbox(sl, 7.95, 3.4, 5.0, 0.8, f"[ {query} ]",
-             dsize=13, ditalic=True, dcolor=p["text_m"],
-             dalign="center", dfont=p["font_body"])
+    _draw_rect(slide, {**el, "color": "#2A3A4A"})   # fallback placeholder
 
 
-def _render_big_stat(prs, s: dict, p: dict) -> None:
-    sl = _blank(prs)
-    _bg(sl, p["bg"])
-    _rect(sl, 0, 0,   13.33, 2.6, p["primary"])
-    _rect(sl, 0, 2.6, 13.33, 2.6, RGBColor(0xF8, 0xF8, 0xF8))
-    _rect(sl, 0, 5.2, 13.33, 2.3, p["secondary"])
-
-    _textbox(sl, 0.5, 0.7, 12.33, 1.6, s["heading"],
-             dsize=30, dbold=True, dcolor=p["bg"],
-             dalign="center", dfont=p["font_heading"])
-
-    stat = s.get("stat", "")
-    if isinstance(stat, dict):
-        stat = stat.get("text", "")
-    _textbox(sl, 0.5, 2.7, 12.33, 2.2, stat,
-             dsize=72, dbold=True, dcolor=p["accent"],
-             dalign="center", dfont=p["font_heading"])
-
-    label = s.get("stat_label", "")
-    if isinstance(label, dict):
-        label = label.get("text", "")
-    if label:
-        _textbox(sl, 0.5, 5.35, 12.33, 1.5, label.upper(),
-                 dsize=20, dbold=True, dcolor=p["text_h"],
-                 dalign="center", dfont=p["font_body"])
+_DRAWERS = {"rect": _draw_rect, "text": _draw_text,
+            "bullets": _draw_bullets, "image": _draw_image}
 
 
-def _render_closing(prs, s: dict, p: dict) -> None:
-    sl = _blank(prs)
-    _bg(sl, p["bg"])
-    _rect(sl, 0, 0,    13.33, 0.4,  p["primary"])
-    _rect(sl, 0, 7.1,  13.33, 0.4,  p["secondary"])
-    _rect(sl, 0.45, 0.55, 0.1, 6.0, p["secondary"])
+# ── Public API ────────────────────────────────────────────────────────────────
 
-    _textbox(sl, 0.9, 1.3, 11.5, 2.0, s["heading"],
-             dsize=58, dbold=True, dcolor=p["primary"],
-             dalign="left", dfont=p["font_heading"])
-
-    _rect(sl, 0.9, 3.4, 8.0, 0.05, p["accent"])
-
-    if s.get("subheading"):
-        _textbox(sl, 0.9, 3.6, 11.0, 1.1, s["subheading"],
-                 dsize=20, ditalic=True, dcolor=p["text_b"],
-                 dfont=p["font_body"])
-
-    if s.get("bullets"):
-        _bullets(sl, 0.9, 4.8, 10.5, 2.0, s["bullets"],
-                 dsize=15, dcolor=p["text_m"],
-                 marker="✦  ", dfont=p["font_body"])
-
-
-# ---------------------------------------------------------------------------
-# Dispatch table
-# ---------------------------------------------------------------------------
-
-_RENDERERS = {
-    "title":       _render_title,
-    "section":     _render_section,
-    "content":     _render_content,
-    "two_column":  _render_two_column,
-    "image_right": _render_image_right,
-    "big_stat":    _render_big_stat,
-    "closing":     _render_closing,
-}
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def render_pptx(filepath: str, spec: dict,
-                palette: dict | None = None) -> str:
+def render_pptx(filepath: str, slides_data: list[dict]) -> dict:
     """
-    Render spec → .pptx file at *filepath*.
+    Render drawing instructions → .pptx file.
 
-    Args:
-        filepath : absolute path ending in .pptx
-        spec     : {"slides": [...], "_images": {query: local_abs_path}}
-        palette  : dict of hex strings from LLM output.
-                   Missing / None → dark charcoal fallback.
+    Each slide dict:
+    {
+      "bg": "#0D1B2A",
+      "elements": [
+        {"type":"rect",    "l":0,"t":0,"w":13.33,"h":0.4, "color":"#FF941F"},
+        {"type":"text",    "l":0.9,"t":1.4,"w":11.2,"h":2.0,
+                           "text":"Heading","size":50,"bold":true,
+                           "color":"#FFFFFF","align":"left","font":"Trebuchet MS"},
+        {"type":"bullets", "l":0.6,"t":2.0,"w":12.0,"h":5.0,
+                           "items":["Point one","Point two"],
+                           "size":17,"color":"#E8F0E0","font":"Calibri","marker":"▸  "},
+        {"type":"image",   "l":7.95,"t":0.9,"w":5.0,"h":6.2,
+                           "image_query":"India flag independence day"},
+      ]
+    }
 
-    Returns "Saved N slides → /path/…" on success, "Error: …" on failure.
+    Returns:
+        {"ok":True,  "path":filepath, "slides":N, "warnings":[...]}
+        {"ok":False, "error":"...", "detail":"...", "warnings":[...]}
+
+    Contrast auto-fix: text elements with ratio < threshold get their color
+    flipped to #FFFFFF or #111111 automatically; the warning is still logged.
     """
+    warnings = []
     try:
-        pal    = _build_pal(palette or {})
-        images = spec.get("_images", {})
-        slides = spec.get("slides",  [])
-
         prs = _new_prs()
-        for s in slides:
-            layout   = s.get("layout", "content")
-            renderer = _RENDERERS.get(layout, _render_content)
-            if layout == "image_right":
-                renderer(prs, s, pal, images)
-            else:
-                renderer(prs, s, pal)
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
 
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        for slide_data in slides_data:
+            slide = _blank(prs)
+            bg    = slide_data.get("bg", "#1C1C1C")
+            _set_bg(slide, bg)
+
+            for el in slide_data.get("elements", []):
+                # ── Contrast check & auto-fix ──────────────────────────────
+                if el.get("type") in ("text", "bullets"):
+                    fg       = el.get("color", "#FFFFFF")
+                    local_bg = el.get("bg_color", bg)
+                    cr       = contrast_ratio(fg, local_bg)
+                    min_cr   = 3.0 if float(el.get("size", 16)) >= 24 else 4.5
+                    if cr < min_cr:
+                        snippet = str(el.get("text") or el.get("items", [""])[:1])[:40]
+                        warnings.append(
+                            f"Contrast fix: '{snippet}' "
+                            f"fg={fg} bg={local_bg} ratio={cr:.2f}→auto-fixed"
+                        )
+                        el["color"] = "#FFFFFF" if _luminance(local_bg) < 0.5 else "#111111"
+
+                # ── Draw ───────────────────────────────────────────────────
+                drawer = _DRAWERS.get(el.get("type"))
+                if drawer:
+                    try:
+                        drawer(slide, el)
+                    except Exception as e:
+                        warnings.append(f"Draw error ({el.get('type')}): {e}")
+
         prs.save(filepath)
-        return f"Saved {len(slides)} slides → {filepath}"
+        return {"ok": True, "path": filepath,
+                "slides": len(slides_data), "warnings": warnings}
 
-    except Exception as exc:
+    except Exception as e:
         import traceback
-        return f"Error: {exc}\n{traceback.format_exc()}"
+        return {"ok": False, "error": str(e),
+                "detail": traceback.format_exc(), "warnings": warnings}
