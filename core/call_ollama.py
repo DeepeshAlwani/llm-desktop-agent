@@ -12,8 +12,9 @@ import threading
 import queue
 import memory
 import uuid
-
+from ppt_agent import call_ppt_agent
 import concurrent.futures
+from langchain_ollama import ChatOllama
 
 
 # ── Voice input (faster-whisper, always-on wake word) ────────────────────────
@@ -81,7 +82,6 @@ from tools import (
     search_files,
     search_file_content,
     web_search,
-    call_ppt_agent,
     WATCHED_FOLDER
 )
 
@@ -91,10 +91,12 @@ from file_manager import (
 )
 
 from watchdog.observers import Observer
+from ppt_agent import call_ppt_agent
 
+llm = ChatOllama(model="granite4.1:8b", num_ctx=16384)
 
 agent = create_agent(
-    model="ollama:granite4.1:8b",
+    model=llm,
     tools=[
            volume_control,
            mute_device,
@@ -647,6 +649,7 @@ while True:
 
     with console.status("[dim]thinking...[/dim]", spinner="dots"):
         result = agent.invoke({"messages": trimmed})
+        console.print(result)
 
     assistant_message = result["messages"][-1]
     blocks = getattr(assistant_message, "content_blocks", None)

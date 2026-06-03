@@ -15,6 +15,20 @@ A short deck of sharp slides beats a long deck of crowded ones every time.
 
 ---
 
+## Research Before Writing
+
+Before writing any content slide, search for the topic of that slide.
+Use the search results to write bullet points with real facts, figures,
+and explanations — not generic summaries from memory.
+
+Each bullet point must be a complete informative sentence with
+specific detail. Bad: "Transformers use attention."
+Good: "The scaled dot-product attention computes Q·Kᵀ/√dₖ, 
+producing attention weights that determine how much each token 
+influences every other token in the sequence."
+
+Never write a slide from memory alone if a search can improve it.
+
 ## What a Slide Is Made Of
 
 A slide is a 13.33 × 7.5 inch canvas. Everything on it is a drawing instruction

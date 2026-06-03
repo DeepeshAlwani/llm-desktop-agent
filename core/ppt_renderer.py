@@ -16,7 +16,6 @@ Never imports ppt_agent or file_manager.
 
 from __future__ import annotations
 import io, os
-import requests
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
@@ -54,17 +53,27 @@ def contrast_ratio(fg: str, bg: str) -> float:
 # ── Image fetching ────────────────────────────────────────────────────────────
 
 def fetch_image(query: str) -> io.BytesIO | None:
+    """
+    Fetch an image for the given query using image_search.py (Pixabay + Unsplash).
+    Falls back to a solid-color placeholder if no results or keys are missing.
+    """
     try:
-        url = f"https://source.unsplash.com/560x420/?{query.replace(' ', ',')}"
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200 and r.content:
-            return io.BytesIO(r.content)
+        from image_search import image_search
+        results = image_search(query, max_results=3, fetch_images=True)
+        good = [r for r in results if not r.fetch_error and r.base64_data]
+        if good:
+            import base64
+            return io.BytesIO(base64.b64decode(good[0].base64_data))
     except Exception:
         pass
+
+    # Fallback: solid colour placeholder so the slide still renders
     try:
         from PIL import Image
         img = Image.new("RGB", (560, 420), (40, 40, 60))
-        buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
         return buf
     except Exception:
         return None

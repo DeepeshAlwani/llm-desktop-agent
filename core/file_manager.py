@@ -17,7 +17,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 
 
-WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agentWATCHED_FOLDER")
+WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agent_workspace")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent_files.db")
 

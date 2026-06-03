@@ -22,10 +22,15 @@ import re
 import json
 from pathlib import Path
 from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+from tools import web_search
+
+from langchain.tools import tool
 
 from file_manager import WATCHED_FOLDER, index_file
 from ppt_renderer import render_pptx
+
+from image_search import image_search_tool
 
 # ── Knowledge doc path ────────────────────────────────────────────────────────
 _HERE = Path(__file__).parent
@@ -170,49 +175,10 @@ def extract_question(raw: str) -> str | None:
     m = re.search(r"<question>(.*?)</question>", raw, re.DOTALL)
     return m.group(1).strip() if m else None
 
-
-# ── Session memory ────────────────────────────────────────────────────────────
-
-class SessionMemory:
-    """Simple in-process message history for one PPT job."""
-
-    def __init__(self, system_prompt: str):
-        self._system = system_prompt
-        self._history: list[dict] = []
-
-    def add_user(self, text: str):
-        self._history.append({"role": "user", "content": text})
-
-    def add_assistant(self, text: str):
-        self._history.append({"role": "assistant", "content": text})
-
-    def messages(self) -> list:
-        """
-        Return as a list of LangChain message objects.
-
-        FIX: Previously returned (role, content) tuples which ChatOllama
-        cannot reliably parse — causing context loss and topic drift.
-        Now returns proper BaseMessage objects that ChatOllama always
-        interprets correctly.
-        """
-        msgs = [SystemMessage(content=self._system)]
-        for m in self._history:
-            if m["role"] == "user":
-                msgs.append(HumanMessage(content=m["content"]))
-            else:
-                msgs.append(AIMessage(content=m["content"]))
-        return msgs
-
-    def summary(self) -> str:
-        return "\n".join(
-            f"[{m['role'].upper()}] {m['content'][:120]}"
-            for m in self._history
-        )
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run_ppt_agent(task: str, ask_callback) -> str:
+    from langchain.agents import create_agent
     """
     Main entry point called by tools.py.
 
@@ -232,30 +198,39 @@ def run_ppt_agent(task: str, ask_callback) -> str:
     # FIX: Pass original task into the system prompt so the LLM always
     # has an immutable anchor even if its conversation context degrades.
     system    = _build_system_prompt(knowledge, original_task=task)
-    memory    = SessionMemory(system)
-    llm       = ChatOllama(model="granite4.1:8b", temperature=0.4)
+    llm = ChatOllama(model="granite4.1:8b", num_ctx=16384)
+    agent       = create_agent(
+                    model = llm,
+                    tools = [web_search, image_search_tool],
+                    system_prompt=system,
 
-    # Seed the conversation with the original task
-    memory.add_user(task)
-
-    MAX_CLARIFICATION_ROUNDS = 3   # FIX: Reduced from 6 — fewer questions,
+    )
+    MAX_CLARIFICATION_ROUNDS = 6   # FIX: Reduced from 6 — fewer questions,
                                    # less chance of context drift.
     round_count = 0
+    conversation_history = []
+    conversation_history.append({"role": "user", "content": task})
+
+    next_message = task
 
     while True:
-        response   = llm.invoke(memory.messages())
-        raw        = response.content
-        print(f"[ppt_agent] Round {round_count} response (first 300 chars):\n{raw[:300]}\n")
+        response = agent.invoke({"messages": conversation_history})
 
-        memory.add_assistant(raw)
+        raw_msg = response["messages"][-1]
+        raw = raw_msg.content if hasattr(raw_msg, "content") else str(raw_msg)
+        #print(f"[ppt_agent] Round {round_count} response (first 300 chars):\n{raw[:300]}\n")
+
 
         # ── Phase 1: clarification ─────────────────────────────────────────
-        question = extract_question(raw)
+        question = extract_question(str(raw))
         if question and round_count < MAX_CLARIFICATION_ROUNDS:
             print(f"[ppt_agent] Asking: {question}")
+            conversation_history.append({"role": "assistant", "content": raw})
+
             answer = ask_callback(question)
-            print(f"[ppt_agent] Answer: {answer}")
-            memory.add_user(answer)
+            conversation_history.append({"role": "user", "content": answer})
+            #print(f"[ppt_agent] Answer: {answer}")
+
             round_count += 1
             continue
 
@@ -266,12 +241,6 @@ def run_ppt_agent(task: str, ask_callback) -> str:
             if round_count < MAX_CLARIFICATION_ROUNDS + 1:
                 # FIX: Explicit nudge that references the original topic,
                 # preventing the model from inventing a new subject.
-                memory.add_user(
-                    f"You have enough information. Please now create the full "
-                    f"presentation about '{task}' using the "
-                    f"<presentation>...</presentation> format from your instructions. "
-                    f"Do not ask any more questions."
-                )
                 round_count += 1
                 continue
             else:
@@ -317,3 +286,32 @@ if __name__ == "__main__":
         ask_callback=cli_callback
     )
     print(f"\nFinal output: {out}")
+
+
+
+@tool("call_ppt_agent", description="""Delegate PowerPoint creation to the dedicated PPT sub-agent.
+Use whenever the user asks to make a PowerPoint, create a deck, or build slides about any topic.
+ 
+The sub-agent will autonomously:
+  1. Invent a full colour palette (hex values) tailored to the topic
+  2. Write 6-8 slides with rich per-element formatting (bold, italic, font sizes)
+  3. Search DuckDuckGo for images and embed them into image slides
+  4. Save the finished .pptx to the workspace
+ 
+When calling this tool, pass a DETAILED task string that includes:
+  • Topic  (required)
+  • Number of slides if the user specified one
+  • Theme hints: dark / light / a mood / brand colours the user mentioned
+  • Desired filename if the user gave one
+ 
+Example call:
+  task = "Create a 7-slide dark-theme deck about climate change, save as climate.pptx"
+ 
+Returns the saved file path on success, or an error string on failure.
+After success, offer to open the file with open_application.""")
+def call_ppt_agent(task: str, ask_callback) -> str:
+    """
+    Args:
+        task: Full natural-language description of the desired presentation.
+    """
+    return run_ppt_agent(task, ask_callback)

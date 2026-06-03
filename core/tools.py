@@ -17,7 +17,8 @@ import time
 import psutil
 import pygetwindow  as gw
 from file_manager import write_docx
-from ppt_agent import run_ppt_agent
+import wikipediaapi
+import requests
 
 
 import shutil as _shutil
@@ -40,7 +41,7 @@ import re
 import shlex
 
 PROFILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "profiles")
-WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agentWATCHED_FOLDER")
+WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agent_workspace")
 
 BLOCKED_PATTERNS = [
     r"\bdel\b", r"\brd\b", r"\brmdir\b",
@@ -111,60 +112,87 @@ def _run_command(command: str, timeout: int = 15) -> str:
     except Exception as e:
         return f"Failed to run command: {e}"
         
+
+# User can set their own SearXNG instance, falls back to a public one
+SEARXNG_URL = os.getenv("SEARXNG_URL", "https://searx.be")
+
+def _searxng_search(query: str, max_results: int = 5) -> list[dict]:
+    try:
+        r = requests.get(
+            f"{SEARXNG_URL}/search",
+            params={
+                "q": query,
+                "format": "json",
+                "engines": "google,bing,wikipedia",
+                "language": "en"
+            },
+            timeout=10,
+            headers={"User-Agent": "ppt-agent/1.0"}
+        )
+        results = r.json().get("results", [])[:max_results]
+        return [
+            {
+                "title": r.get("title", ""),
+                "snippet": r.get("content", ""),
+                "url": r.get("url", "")
+            }
+            for r in results if r.get("content")
+        ]
+    except Exception:
+        return []
+
+def _wikipedia_search(query: str) -> list[dict]:
+    try:
+        wiki = wikipediaapi.Wikipedia(
+            language="en",
+            user_agent="ppt-agent/1.0"
+        )
+        page = wiki.page(query)
+        if page.exists():
+            sections = []
+            for s in page.sections[:4]:
+                if s.text.strip():
+                    sections.append({
+                        "title": f"{page.title} — {s.title}",
+                        "snippet": s.text[:600],
+                        "url": page.fullurl
+                    })
+            if not sections:
+                sections = [{
+                    "title": page.title,
+                    "snippet": page.summary[:800],
+                    "url": page.fullurl
+                }]
+            return sections
+    except Exception:
+        return []
+    return []
+
 @tool("web_search", description="""Search the internet for current information.
 Use for news, recent events, live data, or anything that may have changed since training.
 Always cite the source URLs in your reply.""")
+
 def web_search(query: str, max_results: int = 5) -> str:
-    """
-    Args:
-        query:       The search query.
-        max_results: Number of results to return (1-10).
-    """
-    max_results = max(1, min(10, max_results))
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        return "Error: run 'pip install duckduckgo-search' first."
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-    except Exception as e:
-        return f"Search failed: {e}"
+    """Search the web for information on a topic.
+    Use this to find detailed, accurate content before writing any slide."""
+
+    results = _searxng_search(query, max_results)
+
+    if not results:
+        results = _wikipedia_search(query)
+
     if not results:
         return f"No results found for: '{query}'"
-    lines = [f"Results for: {query}\n"]
-    for i, r in enumerate(results, 1):
-        lines.append(f"{i}. {r.get('title', '')}")
-        lines.append(f"   {r.get('body', '')[:250]}")
-        lines.append(f"   Source: {r.get('href', '')}\n")
-    return "\n".join(lines)
 
-@tool("call_ppt_agent", description="""Delegate PowerPoint creation to the dedicated PPT sub-agent.
-Use whenever the user asks to make a PowerPoint, create a deck, or build slides about any topic.
- 
-The sub-agent will autonomously:
-  1. Invent a full colour palette (hex values) tailored to the topic
-  2. Write 6-8 slides with rich per-element formatting (bold, italic, font sizes)
-  3. Search DuckDuckGo for images and embed them into image slides
-  4. Save the finished .pptx to the workspace
- 
-When calling this tool, pass a DETAILED task string that includes:
-  • Topic  (required)
-  • Number of slides if the user specified one
-  • Theme hints: dark / light / a mood / brand colours the user mentioned
-  • Desired filename if the user gave one
- 
-Example call:
-  task = "Create a 7-slide dark-theme deck about climate change, save as climate.pptx"
- 
-Returns the saved file path on success, or an error string on failure.
-After success, offer to open the file with open_application.""")
-def call_ppt_agent(task: str, ask_callback) -> str:
-    """
-    Args:
-        task: Full natural-language description of the desired presentation.
-    """
-    return run_ppt_agent(task, ask_callback)
+    formatted = []
+    for i, r in enumerate(results, 1):
+        formatted.append(
+            f"[{i}] {r['title']}\n"
+            f"    {r['snippet']}\n"
+            f"    Source: {r['url']}"
+        )
+    return "\n\n".join(formatted)
+
 
 @tool("query_system", description="""Run a read-only system query command in cmd. 
 Use for checking system info, network status, running processes, installed software, 
