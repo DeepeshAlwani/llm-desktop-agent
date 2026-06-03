@@ -124,8 +124,9 @@ The agent can generate fully-designed `.pptx` files autonomously. Say things lik
 - **7 available layouts**: `title`, `section`, `content`, `two_column`, `image_right`, `big_stat`, `closing`
 - **Per-element rich text** — every heading, subheading, and bullet item supports `bold`, `italic`, `size`, and `align` attributes
 - **LLM-generated palettes** — the model invents a colour scheme that matches the topic's mood (e.g. saffron + green for India, teal + deep blue for ocean/science)
-- **Automatic images** — `image_right` slides fetch real photos via DuckDuckGo Images (no API key), saved locally to `_ppt_images/`; a solid-colour placeholder is used if nothing downloads
+- **Automatic images** — image elements fetch real photos via Pixabay and Unsplash (free API keys required; see `.env` setup); a solid-colour placeholder is used if keys are absent or a download fails
 - **`pill_label` overrides** — each slide can display a small topic-specific tab label (e.g. "TIMELINE", "KEY FIGURES") instead of a generic one
+- **Web-researched content** — the sub-agent searches the web via SearXNG before writing each slide, producing detailed factual bullet points rather than shallow summaries; falls back to Wikipedia automatically if the SearXNG instance is unavailable
 - The finished `.pptx` is saved to `agent_workspace/` and indexed for semantic search automatically
 
 ```
@@ -239,6 +240,62 @@ python call_ollama.py
 
 > **Note:** Run from Windows Terminal (not VS Code's integrated terminal) for best results. The live system monitor spawns a new terminal window and requires full TTY support.
 
+---
+
+## Environment Variables
+
+Create a `.env` file in the project root with the following keys. All are optional — the agent runs without them but with reduced capability.
+
+```env
+# Image search for presentations (free accounts, no credit card)
+# Pixabay:  https://pixabay.com/api/docs/
+# Unsplash: https://unsplash.com/oauth/applications  (use the Access Key, not the Secret Key)
+PIXABAY_API_KEY=your_pixabay_key
+UNSPLASH_ACCESS_KEY=your_unsplash_access_key
+
+# Web search for presentation content (optional — falls back to Wikipedia if not set)
+# Self-host: https://docs.searxng.org/admin/installation.html
+# Or use a public instance: https://searx.be
+SEARXNG_URL=https://searx.be
+```
+
+If image keys are not set, presentation image slides will render as solid-colour placeholders. If `SEARXNG_URL` is not set or the instance is unavailable, the agent falls back to Wikipedia for content research.
+
+---
+
+## Known Issues & Technical Notes
+
+### Ollama Context Window — Critical for `ppt_agent`
+
+Ollama's default context window is **4096 tokens** regardless of the model's actual capability. For `granite4.1:8b` (which supports 131,072 tokens), this means the model silently truncates its context to 4096 tokens unless explicitly overridden.
+
+**Symptom:** The PPT sub-agent asks the same clarifying question repeatedly, forgetting answers it received just one round earlier. Token counts in the console stay stuck at exactly 4096 (`prompt_eval_count: 4096`) no matter how long the conversation grows.
+
+**Cause:** `ChatOllama` defaults to `num_ctx=4096`. With `ppt_knowledge.md` already filling most of that budget, there is almost no room left for conversation history.
+
+**Fix applied:** `ChatOllama` is now initialised with an explicit `num_ctx`:
+
+```python
+from langchain_ollama import ChatOllama
+llm = ChatOllama(model="granite4.1:8b", num_ctx=16384)
+```
+
+16,384 tokens is more than sufficient for the clarification loop and leaves comfortable headroom. Using the full 131,072 is possible but significantly increases VRAM usage — not recommended unless you have 16GB+ VRAM.
+
+If you swap to a different model, check its actual context window in the Ollama model card and set `num_ctx` accordingly. The symptom of repeated questions almost always means the context is being truncated.
+
+### DuckDuckGo Web Search — Replaced
+
+The original `web_search` tool used `duckduckgo_search`. DuckDuckGo aggressively blocks automated requests, returning "No results found" on almost every query. The package was also renamed to `ddgs` without a deprecation period, causing import warnings.
+
+**Fix applied:** Replaced with SearXNG (aggregates Google, Bing, Wikipedia) with a Wikipedia fallback. SearXNG works out of the box via the public instance at `https://searx.be` with no API key. Heavy users should self-host.
+
+### Image Search — Replaced
+
+The original renderer fetched images via `source.unsplash.com` — a deprecated Unsplash endpoint that no longer works. Every image element silently fell back to a solid dark-blue rectangle.
+
+**Fix applied:** `ppt_renderer.py` now delegates all image fetching to `image_search.py`, which uses the official Pixabay and Unsplash APIs with proper authentication. The deprecated URL has been removed entirely.
+
 ### Diagnosing slow startup
 
 If the agent takes a long time to start, run the standalone diagnostic:
@@ -278,13 +335,14 @@ llm-desktop-agent/
 │   ├── tools.py            # All LangChain tools (28 tools)
 │   ├── file_manager.py     # File reading/writing, markdown→docx, indexing, tree-sitter, watchdog
 │   ├── memory.py           # SQLite conversation history and semantic memory retrieval
-│   ├── ppt_agent.py        # PPT creation sub-agent: LLM XML spec → DuckDuckGo images → render
+│   ├── ppt_agent.py        # PPT creation sub-agent: clarification loop → LLM XML spec → render
+│   ├── image_search.py     # Pixabay + Unsplash image search with base64 download
 │   ├── ppt_renderer.py     # Standalone PPTX renderer; hex palette + rich-text per element
 │   ├── dashboard.py        # Textual live system monitor (launched separately)
 │   └── diagnose_startup.py # Startup phase timer — run standalone to find slow imports
 ├── profiles/               # Saved user profiles — auto-created on first save
 ├── agent_workspace/        # Sandboxed folder the agent can read/write (on Desktop)
-│   └── _ppt_images/        # Auto-created; caches DDG images downloaded for presentations
+│   └── images/             # Auto-created; caches Pixabay/Unsplash images downloaded for presentations
 ├── agent_files.db          # SQLite index for workspace files and embeddings
 ├── agent_memory.db         # SQLite store for conversation history and embeddings
 ├── assets/
@@ -399,10 +457,12 @@ You: build a presentation on our Q3 results, save it as q3_review.pptx
 
 The PPT pipeline:
 
-1. The LLM produces a `<presentation>` XML block containing a custom `<palette>` and one `<slide>` per slide
-2. Images for `image_right` slides are fetched from DuckDuckGo Images (no API key) and cached in `_ppt_images/`
-3. `ppt_renderer.py` converts the spec into a proper `.pptx` file using python-pptx
-4. The finished file is saved to `agent_workspace/` and indexed for semantic search
+1. The sub-agent (`ppt_agent.py`) asks up to 2 clarifying questions to understand audience, topic depth, and format — then proceeds automatically
+2. The LLM searches the web via SearXNG (with Wikipedia fallback) to gather factual content before writing each slide
+3. The LLM produces a `<presentation>` XML block with a custom colour palette and one `<slide>` per slide, with per-element rich text formatting
+4. Images are fetched via Pixabay and Unsplash using `image_search.py` and embedded directly into the `.pptx`
+5. `ppt_renderer.py` converts the spec into a proper `.pptx` file using python-pptx, with automatic contrast violation fixes
+6. The finished file is saved to `agent_workspace/` and indexed for semantic search
 
 **Available layouts:** `title` · `section` · `content` · `two_column` · `image_right` · `big_stat` · `closing`
 
@@ -440,7 +500,7 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 - [✔️] Wake word detection so voice activates hands-free (no hotkey hold)
 - [✔️] Voice feedback — TTS responses so the agent speaks back
 - [✔️] Web search tool — agent can search the web inline
-- [✔️] Presentation creation — full `.pptx` generation with LLM-designed palettes and DDG images
+- [✔️] Presentation creation — full `.pptx` generation with LLM-designed palettes, SearXNG/Wikipedia web research, and Pixabay/Unsplash images
 - [✔️] Markdown → Word document writing (headings, bullets, tables via python-docx)
 - [✔️] Context window tracking — token count displayed per turn with colour-coded usage
 - [ ] Night light toggle via Windows registry
