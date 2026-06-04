@@ -17,9 +17,9 @@
 
 ## What is this?
 
-`llm-desktop-agent` is a fully local AI agent that lets you control your Windows machine through natural language. Ask it to adjust your volume, change screen brightness, open apps, manage profiles, close processes, query system info, read and write files in your workspace, or chain multiple actions together — all without touching the cloud.
+`llm-desktop-agent` is a fully local AI agent that lets you control your Windows machine through natural language. Ask it to adjust your volume, change screen brightness, open apps, manage profiles, close processes, query system info, read and write files in your workspace, create presentations, or search the web — all without touching the cloud.
 
-It uses [Ollama](https://ollama.com) to run LLMs locally on your hardware and [LangChain](https://langchain.com) to give the model real tools it can act on. The terminal interface is built with [Rich](https://github.com/Textualize/rich) for clean formatted output, and a live system monitor is available via [Textual](https://github.com/Textualize/textual).
+It uses [Ollama](https://ollama.com) to run LLMs locally on your hardware and [LangGraph](https://langchain-ai.github.io/langgraph/) to orchestrate a **multi-agent system** where a supervisor routes each request to a dedicated specialist agent. The terminal interface is built with [Rich](https://github.com/Textualize/rich) for clean formatted output, and a live system monitor is available via [Textual](https://github.com/Textualize/textual).
 
 ```
 You: apply my gaming profile
@@ -106,10 +106,11 @@ Supported file types for reading and indexing:
 Code files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, and more) are semantically chunked at the function/method level using [tree-sitter](https://tree-sitter.github.io/tree-sitter/) when the grammar package is installed, falling back to overlapping line chunks otherwise.
 
 ### Intelligence
+- **Multi-agent routing** — a LangGraph supervisor classifies every request and dispatches it to the right specialist agent; each agent has a focused context and tool set rather than one monolithic prompt with 20+ tools
 - **Profile system** — save and load named configurations with multiple apps, optional URLs per app, volume and brightness (e.g. "study", "gaming", "focus")
-- **Multi-step reasoning** — one request chains multiple tools automatically
+- **Multi-step reasoning** — one request chains multiple tools automatically within the responsible agent
 - **System awareness** — checks if apps are already running before opening, detects tray vs visible windows, verifies actions with follow-up tool calls
-- **Web search** — the agent can search the web and return results inline via the `web_search` tool
+- **Web search** — `rag_agent` searches the web via SearXNG + Wikipedia fallback and returns results inline
 - **CMD access** — controlled read/write access to Windows command line split into two tools: read-only queries (`query_system`) and state-changing commands (`run_system_command`) with mandatory user confirmation
 - **Command safety layer** — blocklist of destructive operations (`del`, `format`, `reg delete`, `diskpart`, symlink creation, script file writes, etc.) refused regardless of how they're requested; separate confirmation gate for shutdown, restart, `winget install/uninstall`, and network changes
 - **Persistent memory** — SQLite-backed conversation history with semantic retrieval; past relevant exchanges are injected into context automatically using cosine similarity scoring
@@ -163,7 +164,8 @@ Assistant: Designed 7 slides with custom palette → Saved to agent_workspace/hi
 | Tool | Role |
 |---|---|
 | [Ollama](https://ollama.com) | Local LLM inference runtime |
-| [LangChain](https://python.langchain.com) | Agent framework and tool orchestration |
+| [LangChain](https://python.langchain.com) | Tool definitions, LLM bindings, message schema |
+| [LangGraph](https://langchain-ai.github.io/langgraph/) | Multi-agent graph: supervisor + specialist nodes |
 | [Rich](https://github.com/Textualize/rich) | Terminal formatting, markdown, tables |
 | [Textual](https://github.com/Textualize/textual) | Interactive live system monitor TUI |
 | [psutil](https://github.com/giampaolo/psutil) | Cross-platform process and system utilities |
@@ -331,27 +333,36 @@ The assistant uses always-on voice activation — just say **"hello"** to wake i
 ```
 llm-desktop-agent/
 ├── core/
-│   ├── call_ollama.py      # Agent loop, conversation management, Rich rendering, voice input
-│   ├── tools.py            # All LangChain tools (28 tools)
-│   ├── file_manager.py     # File reading/writing, markdown→docx, indexing, tree-sitter, watchdog
-│   ├── memory.py           # SQLite conversation history and semantic memory retrieval
-│   ├── ppt_agent.py        # PPT creation sub-agent: clarification loop → LLM XML spec → render
-│   ├── image_search.py     # Pixabay + Unsplash image search with base64 download
-│   ├── ppt_renderer.py     # Standalone PPTX renderer; hex palette + rich-text per element
-│   ├── dashboard.py        # Textual live system monitor (launched separately)
-│   └── diagnose_startup.py # Startup phase timer — run standalone to find slow imports
-├── profiles/               # Saved user profiles — auto-created on first save
-├── agent_workspace/        # Sandboxed folder the agent can read/write (on Desktop)
-│   └── images/             # Auto-created; caches Pixabay/Unsplash images downloaded for presentations
-├── agent_files.db          # SQLite index for workspace files and embeddings
-├── agent_memory.db         # SQLite store for conversation history and embeddings
+│   ├── call_ollama.py          # Agent loop, conversation management, Rich rendering, voice input
+│   ├── tools.py                # All LangChain tool definitions
+│   ├── agents/
+│   │   ├── graph.py            # LangGraph StateGraph — wires all nodes into a compiled graph
+│   │   ├── supervisor_node.py  # Routing supervisor — classifies each request and dispatches it
+│   │   ├── ppt_agent_node.py   # PowerPoint creation pipeline
+│   │   ├── window_agent_node.py# Desktop control: audio, brightness, apps, window layout, profiles
+│   │   ├── shell_agent_node.py # Shell/CMD access: queries and state-changing commands
+│   │   ├── file_agent_node.py  # Workspace file CRUD, search by name/extension
+│   │   ├── rag_agent_node.py   # Semantic file search + web search
+│   │   └── general_result_agent_node.py  # Conversation, Q&A, capability help
+│   ├── file_manager.py         # File reading/writing, markdown→docx, indexing, tree-sitter, watchdog
+│   ├── memory.py               # SQLite conversation history and semantic memory retrieval
+│   ├── image_search.py         # Pixabay + Unsplash image search with base64 download
+│   ├── ppt_renderer.py         # Standalone PPTX renderer; hex palette + rich-text per element
+│   ├── ppt_knowledge.md        # Reference knowledge injected into the PPT agent context
+│   ├── dashboard.py            # Textual live system monitor (launched separately)
+│   └── diagnose_startup.py     # Startup phase timer — run standalone to find slow imports
+├── profiles/                   # Saved user profiles — auto-created on first save
+├── agent_workspace/            # Sandboxed folder the agent can read/write (on Desktop)
+│   └── images/                 # Auto-created; caches Pixabay/Unsplash images for presentations
+├── agent_files.db              # SQLite index for workspace files and embeddings
+├── agent_memory.db             # SQLite store for conversation history and embeddings
 ├── assets/
-│   └── preview.png         # Terminal screenshot for README
+│   └── preview.png             # Terminal screenshot for README
 ├── requirements.txt
 └── README.md
 ```
 
-The agent logic, tool definitions, file management, memory, and presentation pipeline are kept intentionally separate so components can be swapped or extended without touching the others.
+The supervisor routes each user message to exactly one specialist agent. Each agent operates with its own focused system prompt and tool set — no agent sees tools it doesn't need. This keeps context windows lean and routing accurate.
 
 ---
 
@@ -369,17 +380,18 @@ User input (typed or voice)
    Semantic memory retrieval
    (past relevant exchanges injected into context)
         ↓
-   LangChain Agent
-   + 28 tool definitions
+   LangGraph Supervisor
+   (classifies intent → routes to specialist agent)
         ↓
-   LLM decides which tool(s) to call and in what order
+   ┌──────────┬──────────────┬─────────────┬───────────┬──────────────┐
+   ppt_agent  window_agent  shell_agent  file_agent  rag_agent  general_agent
         ↓
-   Python dispatcher executes:
+   Agent executes its tools:
    pycaw / pyautogui / subprocess / sbc / psutil / win32api / win32gui
    file_manager / sqlite / watchdog / tree-sitter / ollama embeddings
-   ppt_agent → ppt_renderer (presentation pipeline)
+   ppt_renderer (presentation pipeline)
         ↓
-   Tool result returned to LLM
+   Supervisor surfaces result
         ↓
    Rich-formatted response to user
 ```
@@ -519,7 +531,7 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 
 ### Long Term
 - [ ] Native Windows GUI using PySide6 (no Electron, no web wrapper)
-- [ ] LangGraph-based agent for more complex multi-step planning
+- [✔️] LangGraph multi-agent system — supervisor routes to specialist agents (ppt, window, shell, file, rag, general)
 - [ ] Plugin system so users can add tools without modifying core files
 - [ ] Auto-discovery of user preferences over time
 
@@ -539,7 +551,8 @@ Contributions are very welcome.
 
 ### What to Contribute
 
-- **New tools** — anything controllable via Python on Windows. Add in `tools.py` with the `@tool` decorator and a clear docstring.
+- **New tools** — anything controllable via Python on Windows. Add in `tools.py` with the `@tool` decorator and a clear docstring, then wire it into the appropriate agent node.
+- **New agents** — have a capability that doesn't fit any existing agent? Add a new node in `agents/`, register it in `graph.py`, and add a routing token to `supervisor_node.py`.
 - **Bug fixes** — especially around app launching, process detection, or COM audio edge cases
 - **Model testing** — tested a model not in the recommended list? Open a PR updating the table
 - **App aliases** — know the real process name for a common app? Add it to `APP_ALIASES` in `tools.py`
@@ -561,7 +574,8 @@ Open an issue with: OS version, Python version, Ollama model name, and the exact
 ## Acknowledgements & Shoutouts
 
 - **[Ollama](https://ollama.com)** — for making local LLM inference genuinely easy. Without this the whole project requires a cloud dependency.
-- **[LangChain](https://python.langchain.com)** — the agent framework handling tool calling, conversation state, and the glue between the LLM and Python.
+- **[LangChain](https://python.langchain.com)** — tool definitions, LLM bindings, and the message schema that ties everything together.
+- **[LangGraph](https://langchain-ai.github.io/langgraph/)** — the multi-agent graph framework that replaced the original monolithic agent. The supervisor + specialist node pattern made routing clean and each agent's context minimal.
 - **[Rich](https://github.com/Textualize/rich)** and **[Textual](https://github.com/Textualize/textual)** — for making terminal output actually look good.
 - **[pycaw](https://github.com/AndreMiras/pycaw)** — the only sane way to control Windows audio from Python.
 - **[screen-brightness-control](https://github.com/Crozzers/screen-brightness-control)** — handles the messy DDC/CI and WMI layers so you don't have to.
