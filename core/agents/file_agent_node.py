@@ -25,6 +25,7 @@ from typing import Any
 from langchain_ollama import ChatOllama
 from langchain.agents import create_agent
 from langgraph.types import Command
+from datetime import datetime
 
 from tools import (
     read_file,
@@ -36,9 +37,10 @@ from tools import (
     getWATCHED_FOLDER_tree,
 )
 
-_PROMPT = """You are a workspace file manager for a Windows desktop agent.
+_PROMPT = f"""You are a workspace file manager for a Windows desktop agent.
 Your workspace root is the agent_workspace folder on the Desktop.
 All file paths you receive and return are relative to this root.
+Today's date is {datetime.now().strftime("%B %d, %Y")}
 
 RULES:
 - list_files       → list files/folders in the workspace or a subfolder.

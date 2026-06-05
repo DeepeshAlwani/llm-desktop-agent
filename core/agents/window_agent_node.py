@@ -22,6 +22,7 @@ Shared state keys:
 """
 
 from __future__ import annotations
+import re
 from typing import Any
 
 from langchain_ollama import ChatOllama
@@ -52,7 +53,7 @@ from tools import (
     list_all_saved_profiles_names,
 )
 
-_PROMPT = """You are a Windows desktop control assistant.
+_PROMPT = f"""You are a Windows desktop control assistant.
 You manage audio, display, running applications, window layout, and saved profiles.
 
 RULES:
@@ -74,6 +75,9 @@ CRITICAL:
 - Never invent information not returned by a tool.
 - Report exact errors — never explain why something might have failed.
 - Never describe actions unless a tool was actually called and returned a result.
+- If the user asks for something outside desktop/window/audio scope (web search,
+  shell commands, file management, presentations), respond ONLY with:
+  <needs_specialist>restate the request clearly</needs_specialist>
 """
 
 _TOOLS = [
@@ -97,6 +101,18 @@ def window_agent_node(state: dict[str, Any]) -> Command:
     response = agent.invoke({"messages": history})
     raw      = response["messages"][-1]
     result   = raw.content if hasattr(raw, "content") else str(raw)
+
+    # ── Delegation: bounce out-of-scope requests to supervisor ────────────────
+    match = re.search(r"<needs_specialist>(.*?)</needs_specialist>", result, re.DOTALL)
+    if match:
+        refined_task = match.group(1).strip()
+        print(f"[window_agent] delegating to supervisor → \'{refined_task}\'")
+        return Command(
+            update={
+                "messages": list(history) + [{"role": "user", "content": refined_task}],
+            },
+            goto="supervisor",
+        )
 
     history.append({"role": "assistant", "content": result})
 

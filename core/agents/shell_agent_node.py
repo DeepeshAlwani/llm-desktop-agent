@@ -20,11 +20,13 @@ Shared state keys:
 """
 
 from __future__ import annotations
+import re
 from typing import Any
 
 from langchain_ollama import ChatOllama
 from langchain.agents import create_agent
 from langgraph.types import Command
+from datetime import datetime
 
 from tools import (
     query_system,
@@ -32,8 +34,9 @@ from tools import (
     show_system_monitor,
 )
 
-_PROMPT = """You are a Windows shell command assistant.
+_PROMPT = f"""You are a Windows shell command assistant.
 You run system queries and state-changing commands on behalf of the user.
+Today's date is {datetime.now().strftime("%B %d, %Y")}
 
 RULES:
 - query_system  → read-only commands: ipconfig, tasklist, netstat, systeminfo,
@@ -55,6 +58,9 @@ SAFETY:
 CRITICAL:
 - Never invent command output. Report exactly what the tool returns.
 - If a command is blocked for safety reasons, explain that clearly.
+- If the user asks for something outside shell/system scope (web search, file search,
+  window control, presentations), respond ONLY with:
+  <needs_specialist>restate the request clearly</needs_specialist>
 """
 
 _TOOLS = [query_system, run_system_command, show_system_monitor]
@@ -72,6 +78,18 @@ def shell_agent_node(state: dict[str, Any]) -> Command:
     response = agent.invoke({"messages": history})
     raw      = response["messages"][-1]
     result   = raw.content if hasattr(raw, "content") else str(raw)
+
+    # ── Delegation: bounce out-of-scope requests to supervisor ────────────────
+    match = re.search(r"<needs_specialist>(.*?)</needs_specialist>", result, re.DOTALL)
+    if match:
+        refined_task = match.group(1).strip()
+        print(f"[shell_agent] delegating to supervisor → \'{refined_task}\'")
+        return Command(
+            update={
+                "messages": list(history) + [{"role": "user", "content": refined_task}],
+            },
+            goto="supervisor",
+        )
 
     history.append({"role": "assistant", "content": result})
 

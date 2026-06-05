@@ -26,6 +26,7 @@ python-pptx==1.0.2
 wikipedia-api==0.15.0
 python-dotenv==1.2.2
 langgraph-supervisor==0.0.31
+tavily-python==0.7.25
 
 # Voice input (optional — agent works without these)
 faster-whisper==1.2.1

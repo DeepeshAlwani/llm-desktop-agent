@@ -19,6 +19,8 @@ import pygetwindow  as gw
 from file_manager import write_docx
 import wikipediaapi
 import requests
+from tavily import TavilyClient
+
 
 
 import shutil as _shutil
@@ -114,33 +116,27 @@ def _run_command(command: str, timeout: int = 15) -> str:
         
 
 # User can set their own SearXNG instance, falls back to a public one
-SEARXNG_URL = os.getenv("SEARXNG_URL", "https://searx.be")
 
-def _searxng_search(query: str, max_results: int = 5) -> list[dict]:
+_tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
+def _tavily_search(query: str, max_results: int = 5) -> list[dict]:
     try:
-        r = requests.get(
-            f"{SEARXNG_URL}/search",
-            params={
-                "q": query,
-                "format": "json",
-                "engines": "google,bing,wikipedia",
-                "language": "en"
-            },
-            timeout=10,
-            headers={"User-Agent": "ppt-agent/1.0"}
+        response = _tavily.search(
+            query=query,
+            search_depth="advanced",   # follows links, not just snippets
+            max_results=max_results,
+            include_answer=True        # gives a synthesised answer too
         )
-        results = r.json().get("results", [])[:max_results]
         return [
             {
-                "title": r.get("title", ""),
+                "title":   r.get("title", ""),
                 "snippet": r.get("content", ""),
-                "url": r.get("url", "")
+                "url":     r.get("url", "")
             }
-            for r in results if r.get("content")
+            for r in response.get("results", []) if r.get("content")
         ]
-    except Exception:
+    except Exception as e:
         return []
-
 def _wikipedia_search(query: str) -> list[dict]:
     try:
         wiki = wikipediaapi.Wikipedia(
@@ -176,13 +172,18 @@ def web_search(query: str, max_results: int = 5) -> str:
     """Search the web for information on a topic.
     Use this to find detailed, accurate content before writing any slide."""
 
-    results = _searxng_search(query, max_results)
+    results = _tavily_search(query, max_results)
 
     if not results:
         results = _wikipedia_search(query)
 
     if not results:
-        return f"No results found for: '{query}'"
+        # Be explicit — do NOT let the agent fill the gap with training data
+        return (
+            f"WEB_SEARCH_FAILED: No results returned for '{query}'. "
+            "Do not answer from training data. Tell the user the search returned "
+            "no results and suggest they try again or rephrase."
+        )
 
     formatted = []
     for i, r in enumerate(results, 1):
@@ -192,6 +193,23 @@ def web_search(query: str, max_results: int = 5) -> str:
             f"    Source: {r['url']}"
         )
     return "\n\n".join(formatted)
+
+@tool("fetch_page", description="""Fetch and read the full text content of a webpage URL.
+Use this after web_search when you need to read the full article, not just the snippet.
+Pass the URL from a web_search result.""")
+def fetch_page(url: str) -> str:
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "websearch-agent/1.0"})
+        # Strip HTML tags — just get readable text
+        from html.parser import HTMLParser
+        class _Strip(HTMLParser):
+            def __init__(self): super().__init__(); self.text = []
+            def handle_data(self, d): self.text.append(d)
+        p = _Strip(); p.feed(r.text)
+        text = " ".join(p.text.split())
+        return text[:4000]  # cap to avoid flooding context
+    except Exception as e:
+        return f"Could not fetch page: {e}"
 
 
 @tool("query_system", description="""Run a read-only system query command in cmd. 

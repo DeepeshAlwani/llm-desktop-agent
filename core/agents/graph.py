@@ -36,7 +36,8 @@ from agents.ppt_agent_node     import ppt_agent_node
 from agents.window_agent_node  import window_agent_node
 from agents.shell_agent_node   import shell_agent_node
 from agents.file_agent_node    import file_agent_node
-from agents.rag_agent_node     import rag_agent_node
+from agents.rag_agent_node          import rag_agent_node
+from agents.web_search_agent_node   import web_search_agent_node
 from agents.general_result_agent_node import general_agent_node
 
 
@@ -49,10 +50,14 @@ class AgentState(TypedDict, total=False):
     # Routing signal
     next: str
 
+    # Loop guard — incremented each time general_agent delegates back to supervisor
+    bounce_count: int
+
     # Per-agent task inputs and result outputs
-    ppt_task:             str
-    ppt_result:           str | None
-    ppt_pending_question: str | None
+    ppt_task:                str
+    ppt_result:              str | None
+    ppt_pending_question:    str | None
+    ppt_clarification_round: int
 
     window_task:   str
     window_result: str | None
@@ -65,6 +70,9 @@ class AgentState(TypedDict, total=False):
 
     rag_task:   str
     rag_result: str | None
+
+    web_search_task:   str
+    web_search_result: str | None
 
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
@@ -82,7 +90,8 @@ def build_graph():
     builder.add_node("window_agent",  window_agent_node)
     builder.add_node("shell_agent",   shell_agent_node)
     builder.add_node("file_agent",    file_agent_node)
-    builder.add_node("rag_agent",     rag_agent_node)
+    builder.add_node("rag_agent",          rag_agent_node)
+    builder.add_node("web_search_agent", web_search_agent_node)
     builder.add_node("general_agent", general_agent_node)
 
     builder.set_entry_point("supervisor")

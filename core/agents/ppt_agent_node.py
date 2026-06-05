@@ -40,6 +40,7 @@ from tools import web_search
 from image_search import image_search_tool
 from file_manager import WATCHED_FOLDER, index_file
 from ppt_renderer import render_pptx
+from datetime import datetime
 
 # ── Knowledge doc ─────────────────────────────────────────────────────────────
 
@@ -57,37 +58,39 @@ def _load_knowledge() -> str:
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 def _build_system_prompt(knowledge: str, original_task: str) -> str:
-    return f"""You are a presentation designer. Your only reference is the handbook below.
-Read it carefully before every response.
+    today = datetime.now().strftime("%B %d, %Y")
+    return f"""You are a PowerPoint presentation designer. Today is {today}.
 
-{knowledge}
+TASK: "{original_task}"
 
----
+STEP 1 — RESEARCH FIRST (MANDATORY):
+Before writing ANY slide content, call web_search for each topic.
+Example queries: "IPL 2024 winner final score", "IPL 2023 winner man of match"
+Never write facts from memory — always search first.
 
-ORIGINAL TASK (fixed for the entire session):
-"{original_task}"
+STEP 2 — OUTPUT FORMAT (STRICT):
+First output: <title>Descriptive title here</title>
+Then output the presentation using EXACTLY this format:
 
-BEHAVIOR
-========
-Ask questions one at a time until you are confident you understand the topic,
-audience and purpose. Always stay relevant to the ORIGINAL TASK above.
-
-Output only this when asking:
-<question>Your single focused question here.</question>
-
-Once confident, output the full presentation and nothing else:
 <presentation>
-<slide bg="#hex"> ... </slide>
+<slide bg="#0A0A1A">
+  <element type="rect" l="0" t="0" w="13.33" h="0.5" color="#00BCD4"/>
+  <element type="text" l="0.9" t="1.5" w="11.5" h="2.0" text="Slide Heading" size="44" bold="true" italic="false" color="#FFFFFF" align="left" font="Trebuchet MS"/>
+  <element type="bullets" l="0.6" t="3.5" w="12.0" h="3.5" items='["Fact one from search","Fact two from search","Fact three from search"]' size="17" bold="false" italic="false" color="#E0F7FA" font="Calibri" marker="▸  " space_before="10"/>
+</slide>
 </presentation>
 
-OUTPUT RULES (the renderer is strict):
-- Every attribute value must be quoted.
-- items= must be a valid JSON array: '["point one","point two"]'
-- Use &amp; instead of & inside any attribute value.
-- Draw rects before text on every slide (background first, content on top).
-- No prose, no explanation — only the tags.
-"""
+RULES:
+- ALL elements use <element type="..." .../> self-closing tags — no exceptions
+- l, t, w, h are positions in inches (canvas is 13.33 wide × 7.5 tall)
+- items= must be valid JSON: '[\"point one\",\"point two\"]'  
+- Use &amp; instead of & in any text
+- Minimum 6 slides, max 10
+- Draw rect elements BEFORE text elements on the same slide
+- No prose outside the tags
 
+{knowledge}
+"""
 
 # ── XML helpers (unchanged from original) ────────────────────────────────────
 
@@ -170,6 +173,11 @@ def extract_question(raw: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def extract_title(raw: str) -> str | None:
+    m = re.search(r"<title>(.*?)</title>", raw, re.DOTALL)
+    return m.group(1).strip() if m else None
+
+
 # ── LangGraph node function ───────────────────────────────────────────────────
 
 MAX_CLARIFICATION_ROUNDS = 6
@@ -191,7 +199,7 @@ def ppt_agent_node(state: dict[str, Any]) -> Command:
     knowledge = _load_knowledge()
     system    = _build_system_prompt(knowledge, original_task=task)
 
-    llm = ChatOllama(model="granite4.1:8b", num_ctx=16384)
+    llm = ChatOllama(model="granite4.1:8b", num_ctx=32768)
 
     # Each node invocation gets its own internal ReAct agent.
     # Tool calls (web search, image search) happen inside this agent.
@@ -203,10 +211,15 @@ def ppt_agent_node(state: dict[str, Any]) -> Command:
 
     # Internal conversation — seeded with the task
     internal_history = list(state.get("messages", []))
-    if not internal_history or internal_history[-1].get("content") != task:
+    if internal_history:
+        last = internal_history[-1]
+        last_content = last.content if hasattr(last, "content") else last.get("content", "")
+        if last_content != task:
+            internal_history.append({"role": "user", "content": task})
+    else:
         internal_history.append({"role": "user", "content": task})
-
-    round_count = 0
+    # Restore clarification round count across re-invocations
+    round_count = state.get("ppt_clarification_round", 0)
 
     while True:
         response     = agent.invoke({"messages": internal_history})
@@ -220,11 +233,13 @@ def ppt_agent_node(state: dict[str, Any]) -> Command:
             # ask the user; the node will be re-invoked with the answer
             # appended to messages by the supervisor.
             internal_history.append({"role": "assistant", "content": raw})
-            print(f"[ppt_agent] Asking ({round_count+1}/{MAX_CLARIFICATION_ROUNDS}): {question}")
+            round_count += 1   # track so we don't loop forever on clarifications
+            print(f"[ppt_agent] Asking ({round_count}/{MAX_CLARIFICATION_ROUNDS}): {question}")
             return Command(
                 update={
                     "messages": internal_history,
                     "ppt_pending_question": question,
+                    "ppt_clarification_round": round_count,
                     "next": "supervisor",          # supervisor relays question then comes back
                 },
                 goto="supervisor",
@@ -258,8 +273,10 @@ def ppt_agent_node(state: dict[str, Any]) -> Command:
     print(f"[ppt_agent] Parsed {len(slides_data)} slides.")
 
     # ── Render ────────────────────────────────────────────────────────────────
-    slug     = re.sub(r"[^a-z0-9]+", "_", task.lower())[:40].strip("_")
-    filename = f"{slug}.pptx"
+    # Use <title> tag from model output if available, else fall back to task
+    raw_title = extract_title(raw) or task
+    slug      = re.sub(r"[^a-z0-9]+", "_", raw_title.lower())[:50].strip("_")
+    filename  = f"{slug}.pptx"
     abs_path = os.path.abspath(os.path.join(WATCHED_FOLDER, filename))
 
     if not abs_path.startswith(os.path.abspath(WATCHED_FOLDER)):
@@ -267,7 +284,7 @@ def ppt_agent_node(state: dict[str, Any]) -> Command:
             update={"ppt_result": "Error: output path outside workspace.", "next": "supervisor"},
             goto="supervisor",
         )
-
+    print(raw)
     result = render_pptx(abs_path, slides_data)
 
     if result.get("warnings"):
@@ -287,6 +304,7 @@ def ppt_agent_node(state: dict[str, Any]) -> Command:
         update={
             "ppt_result": ppt_result,
             "ppt_pending_question": None,
+            "ppt_clarification_round": 0,   # reset for next run
             "next": "supervisor",
         },
         goto="supervisor",

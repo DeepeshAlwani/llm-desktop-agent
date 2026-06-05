@@ -38,47 +38,50 @@ from langchain_ollama import ChatOllama
 from langchain.agents import create_agent
 from langgraph.types import Command
 
-from tools import (
-    search_file_content,
-    web_search,
-)
+from tools import search_file_content
+from datetime import datetime
 
-_PROMPT = """You are a knowledge retrieval assistant for a Windows desktop agent.
-You have two tools:
+_PROMPT = f"""You are a semantic file search assistant for a Windows desktop agent.
+You search the user's indexed workspace files by meaning and topic.
+Today's date is {datetime.now().strftime("%B %d, %Y")}
 
-1. search_file_content — semantically searches the indexed workspace files.
-   Use when the user asks things like:
-     "find files about X", "which file mentions X", "look for X in my files",
-     "do I have anything on X", "search my workspace for X".
-   Returns ranked file excerpts. Synthesise them into a clear answer.
+TOOL
+====
+  search_file_content — semantically searches indexed workspace files.
+    Use when the user asks:
+      "find files about X", "which file mentions X", "look for X in my files",
+      "do I have anything on X", "search my workspace for X".
+    Returns ranked file excerpts. Synthesise them into a clear answer.
 
-2. web_search — searches the internet via SearXNG + Wikipedia.
-   Use when the user asks about current events, facts, recent data,
-   or anything that might have changed since training.
-   Always cite source URLs in your reply.
+RULES
+=====
+- Only report what search_file_content returns — never invent file contents.
+- Synthesise results into a clear answer; don't dump raw chunks.
+- You cannot read, write, or delete files — direct those requests to the file agent.
+- You do NOT do web search. If the user asks for web/internet/current information,
+  respond with ONLY this tag:
+  <needs_specialist>restate the request as a web search task</needs_specialist>
 
-WHEN TO USE BOTH:
-  If the user asks something like "what do I have on X and what's the latest news
-  on X", call search_file_content first for local context, then web_search for
-  fresh external information, and combine the results.
+DELEGATION EXAMPLES
+===================
+  User: "search the web for X"
+  → <needs_specialist>search the web for X</needs_specialist>
 
-RULES:
-- Do not guess or hallucinate file contents — only report what the tools return.
-- For web results, cite the source URL for every factual claim.
-- If search_file_content returns no relevant results, say so clearly and offer
-  to search the web instead.
-- You cannot read, write, or delete files — if the user wants to do that,
-  tell them to ask the file agent.
+  User: "what's the latest news on X?"
+  → <needs_specialist>find latest news about X</needs_specialist>
 
-CRITICAL:
-- Never invent search results. If a tool returns nothing, say so.
-- Synthesise, don't just dump raw chunks — give the user a useful answer.
+  User: "find files about X and also search online for X"
+  → search files first, then:
+  → <needs_specialist>search the web for X</needs_specialist>
+
+CRITICAL: Never include any other text alongside the <needs_specialist> tag.
 """
 
-_TOOLS = [search_file_content, web_search]
+_TOOLS = [search_file_content]
 
 
 def rag_agent_node(state: dict[str, Any]) -> Command:
+    import re
     task    = state.get("rag_task", "")
     # Slightly larger context here — RAG responses can be long
     llm     = ChatOllama(model="granite4.1:8b", num_ctx=12288)
@@ -91,6 +94,18 @@ def rag_agent_node(state: dict[str, Any]) -> Command:
     response = agent.invoke({"messages": history})
     raw      = response["messages"][-1]
     result   = raw.content if hasattr(raw, "content") else str(raw)
+
+    # ── Delegation: bounce web-search requests to supervisor ──────────────────
+    match = re.search(r"<needs_specialist>(.*?)</needs_specialist>", result, re.DOTALL)
+    if match:
+        refined_task = match.group(1).strip()
+        print(f"[rag_agent] delegating to supervisor → '{refined_task}'")
+        return Command(
+            update={
+                "messages": list(history) + [{"role": "user", "content": refined_task}],
+            },
+            goto="supervisor",
+        )
 
     history.append({"role": "assistant", "content": result})
 

@@ -29,12 +29,14 @@ from typing import Any
 from langchain_ollama import ChatOllama
 from langgraph.types import Command
 from langchain_core.messages import HumanMessage, AIMessage
+from datetime import datetime
 
 
 # ── Routing prompt ─────────────────────────────────────────────────────────────
 
-_ROUTER_PROMPT = """You are a routing supervisor for a Windows desktop AI assistant.
+_ROUTER_PROMPT = f"""You are a routing supervisor for a Windows desktop AI assistant.
 Your ONLY job is to output exactly ONE of these routing tokens — nothing else:
+Today's date is {datetime.now().strftime("%B %d, %Y")}
 
   ppt_agent     — user wants to CREATE a PowerPoint / deck / slides
   window_agent  — audio volume, mute, media play/pause, screen brightness,
@@ -46,9 +48,10 @@ Your ONLY job is to output exactly ONE of these routing tokens — nothing else:
   file_agent    — read a file, write/create a file, delete a file, move/rename a file,
                   list files in workspace, find a file by name or extension,
                   show folder tree
-  rag_agent     — search file CONTENTS by meaning/topic ("find files about X",
-                  "which file mentions X"), web search, look up current information,
-                  recent news, facts from the internet
+  rag_agent         — search file CONTENTS by meaning/topic ("find files about X",
+                      "which file mentions X"), semantic search over local files
+  web_search_agent  — web search, look up current information, recent news,
+                      facts from the internet, anything requiring live data
   general_agent — for general Q&A where no special tools or data is needed.
 
 Output only the token. No explanation. No punctuation.
@@ -80,7 +83,7 @@ def supervisor_node(state: dict[str, Any]) -> Command:
 
     # ── 2. Sub-agent finished — surface result ────────────────────────────────
     for result_key in ("ppt_result", "window_result", "shell_result",
-                       "file_result", "rag_result", "general_result"):
+                       "file_result", "rag_result", "web_search_result", "general_result"):
         result_val = state.get(result_key)
         if result_val:
             return Command(
@@ -111,7 +114,7 @@ def supervisor_node(state: dict[str, Any]) -> Command:
         return Command(update={}, goto="__end__")
     
     # Tiny context — just classify, no tool calls needed
-    llm = ChatOllama(model="granite4.1:8b", num_ctx=512)
+    llm = ChatOllama(model="llama3.2:3b", num_ctx=512)
     routing_response = llm.invoke([
         {"role": "system", "content": _ROUTER_PROMPT},
         {"role": "user",   "content": last_user_msg},
@@ -128,9 +131,9 @@ def supervisor_node(state: dict[str, Any]) -> Command:
         destination = "shell_agent"
     elif "file" in raw_decision:
         destination = "file_agent"
-    elif "rag" in raw_decision or "search" in raw_decision:
-        # Default: rag covers web search and semantic search;
-        # also a safe fallback for ambiguous queries
+    elif "web_search" in raw_decision or "web" in raw_decision:
+        destination = "web_search_agent"
+    elif "rag" in raw_decision or "semantic" in raw_decision or "file search" in raw_decision:
         destination = "rag_agent"
     else:
         destination = "general_agent"
@@ -139,7 +142,27 @@ def supervisor_node(state: dict[str, Any]) -> Command:
 
     task_key = destination.replace("_agent", "_task")   # e.g. "ppt_task", "window_task"
 
+    # ── Bounce-loop guard ─────────────────────────────────────────────────────
+    bounce_count = state.get("bounce_count", 0)
+    if destination == "general_agent":
+        # Still going to general_agent — increment to track repeated bounces
+        new_bounce_count = bounce_count + 1
+    else:
+        # Routed to a real specialist — reset the counter
+        new_bounce_count = 0
+
+    if bounce_count >= 2:
+        # general_agent has already bounced twice — give up gracefully
+        fallback = "I wasn't able to complete that request. Could you try rephrasing it?"
+        return Command(
+            update={
+                "messages": list(messages) + [{"role": "assistant", "content": fallback}],
+                "bounce_count": 0,
+            },
+            goto="__end__",
+        )
+
     return Command(
-        update={task_key: last_user_msg, "next": destination},
+        update={task_key: last_user_msg, "next": destination, "bounce_count": new_bounce_count},
         goto=destination,
     )

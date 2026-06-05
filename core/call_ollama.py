@@ -45,6 +45,8 @@ except ImportError:
 
 import tiktoken
 
+TTS_AVAILABLE = False
+
 # ── Multi-agent graph (replaces the single `agent`) ──────────────────────────
 from agents.graph import get_app
 
