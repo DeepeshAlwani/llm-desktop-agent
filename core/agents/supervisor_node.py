@@ -42,10 +42,10 @@ Today's date is {datetime.now().strftime("%B %d, %Y")}
   ppt_agent     — user wants to CREATE a PowerPoint / deck / slides
   window_agent  — audio volume, mute, media play/pause, screen brightness,
                   open/close/focus an app, window resize/snap/layout,
-                  saved profiles (save/load/delete)
+                  saved profiles (save/load/delete), update resolution, look for available resolution,
   shell_agent   — run a shell/cmd command, check system info (ipconfig, tasklist,
                   netstat, systeminfo, winget list), install/uninstall software,
-                  shutdown/restart, show system monitor/resource usage
+                  shutdown/restart, show system monitor/resource usage (not for changing resolution)
   file_agent    — read a file, write/create a file, delete a file, move/rename a file,
                   list files in workspace, find a file by name or extension,
                   show folder tree
@@ -178,7 +178,7 @@ def supervisor_node(state: dict[str, Any]) -> Command:
         )
 
     # Tiny context — just classify, no tool calls needed
-    llm = ChatOllama(model="llama3.2:3b", num_ctx=512)
+    llm = ChatOllama(model="granite4.1:8b", num_ctx=512)
     routing_response = llm.invoke([
         {"role": "system", "content": _ROUTER_PROMPT},
         {"role": "user",   "content": last_user_msg},
@@ -189,7 +189,7 @@ def supervisor_node(state: dict[str, Any]) -> Command:
     # Normalise — model might add punctuation or extra words
     if "ppt" in raw_decision:
         destination = "ppt_agent"
-    elif "window" in raw_decision:
+    elif "window" in raw_decision or "resolution" in raw_decision:
         destination = "window_agent"
     elif "shell" in raw_decision:
         destination = "shell_agent"

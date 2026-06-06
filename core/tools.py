@@ -20,6 +20,9 @@ from file_manager import write_docx
 import wikipediaapi
 import requests
 from tavily import TavilyClient
+import win32api
+
+from collections import defaultdict
 
 
 
@@ -44,6 +47,9 @@ import shlex
 
 PROFILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "profiles")
 WATCHED_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "agent_workspace")
+
+
+_DEVMODE_CACHE = {}  # (width, height, refresh) -> raw enum index
 
 BLOCKED_PATTERNS = [
     r"\bdel\b", r"\brd\b", r"\brmdir\b",
@@ -323,35 +329,78 @@ def get_current_volume() -> str:
     except Exception as e:
         return f"Error doing so: {e}"
 
-@tool("volume control", description="Adjusts the system volume")
-def volume_control(vol_perc: int) -> str :
+@tool("volume control", description="Adjusts the per app volume or system volume")
+def volume_control(
+    vol_perc: int,
+    target: str = "system"
+) -> str:
     """
-        Use this tool to adjust the volume of the system.
+    Adjust system or application volume.
 
-        Args:
-            vol_perc: The volume percentage you want the system at.
+    Args:
+        vol_perc: Volume percentage (0-100)
+        target: "system" or process name such as
+                "spotify.exe", "chrome.exe", "discord.exe"
     """
+
     try:
         CoInitialize()
-        device = AudioUtilities.GetSpeakers()
 
-        if device is not None:
+        vol_perc = max(0, min(100, vol_perc))
+        volume_scalar = vol_perc / 100
+
+        # SYSTEM VOLUME
+        if target.lower() == "system":
+            device = AudioUtilities.GetSpeakers()
+
+            if device is None:
+                return "No audio device present"
+
             volume = device.EndpointVolume
-        else:
-            return f"No Audio device present"
 
-        if volume.GetMute():
-            volume.SetMute(0, None)
+            if volume.GetMute():
+                volume.SetMute(0, None)
 
-        volume.SetMasterVolumeLevelScalar(vol_perc / 100, None)
+            volume.SetMasterVolumeLevelScalar(
+                volume_scalar,
+                None
+            )
 
-        CoUninitialize()
+            return f"System volume set to {vol_perc}%"
 
-        return f"Volume Set to: {vol_perc}"
+        # APP VOLUME
+        sessions = AudioUtilities.GetAllSessions()
+
+        for session in sessions:
+            process = session.Process
+
+            if process is None:
+                continue
+
+            if process.name().lower() == target.lower():
+
+                simple_volume = session.SimpleAudioVolume
+
+                if simple_volume.GetMute():
+                    simple_volume.SetMute(0, None)
+
+                simple_volume.SetMasterVolume(
+                    volume_scalar,
+                    None
+                )
+
+                return (
+                    f"{process.name()} volume set "
+                    f"to {vol_perc}%"
+                )
+
+        return f"{target} is not playing any audio"
+
     except Exception as e:
-        print(e)
         return f"Something went wrong: {e}"
-    
+
+    finally:
+        CoUninitialize()    
 @tool("Mute/unmute_Device", description="Use this tool to mute or unmute the audio device")
 def mute_device() -> str :
     """
@@ -911,6 +960,67 @@ def resize_window(
         )
     except Exception as e:
         return f"Failed to resize window: {e}"
+
+
+@tool("get available resolutions", description="use this tool to get the available resolution for the current monitor")
+def get_available_resolutions():
+    available_resolutions = []
+    index = 0
+    print("it is being used")
+    try:
+        while True:
+            mode = win32api.EnumDisplaySettings(None, index)
+            available_resolutions.append({
+                "index": index,
+                "width": mode.PelsWidth,
+                "height": mode.PelsHeight,
+                "refresh": mode.DisplayFrequency
+            })
+            index += 1
+        
+    except Exception:
+        pass
+    _DEVMODE_CACHE.clear()
+    grouped = defaultdict(list)
+    for mode in available_resolutions:
+        key = (mode["width"], mode["height"])
+        grouped[key].append(mode["refresh"])
+        _DEVMODE_CACHE[(mode["width"], mode["height"], mode["refresh"])] = mode["index"]
+
+    lines = ["Available resolutions:"]
+    for i, ((w, h), rates) in enumerate(sorted(grouped.items(), reverse=True), 1):
+        rates_str = ", ".join(str(r) for r in sorted(set(rates)))
+        lines.append(f"{i}. {w} x {h}  —  {rates_str} Hz")
+    
+    print(lines)
+
+    return "\n".join(lines)
+
+@tool("set resolution", description="use this tool to set the resolution of the display")
+def set_resolution(width: int, height: int, refresh: int) -> str:
+    try:
+        raw_index = _DEVMODE_CACHE.get((width, height, refresh))
+    except Exception as e:
+        return "please run get_available_resolutions() first"
+    print("You are here")
+    if raw_index is None:
+        return f"Resolution {width}x{height} @ {refresh}Hz not found — call get_available_resolutions first"
+    mode = win32api.EnumDisplaySettings(None, raw_index)
+    mode.DisplayFixedOutput = win32con.DMDFO_STRETCH
+    mode.Fields |= win32con.DM_DISPLAYFIXEDOUTPUT
+    result = win32api.ChangeDisplaySettings(mode, 0)
+    if result == -2:  # stretch rejected by driver — retry without it
+        mode = win32api.EnumDisplaySettings(None, raw_index)  # fresh mode, no flags
+        result = win32api.ChangeDisplaySettings(mode, 0)
+
+
+    if result == 0:
+        return f"Resolution set to {width}x{height} @ {refresh}Hz"
+    elif result == 1:
+        return f"Resolution set to {width}x{height} @ {refresh}Hz — restart required"
+    else:
+        return f"Failed to set resolution (code {result})"
+
 
 # ===========================================================================
 # File management tools  (powered by file_manager.py)

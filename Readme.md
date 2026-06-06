@@ -342,7 +342,8 @@ llm-desktop-agent/
 │   │   ├── window_agent_node.py# Desktop control: audio, brightness, apps, window layout, profiles
 │   │   ├── shell_agent_node.py # Shell/CMD access: queries and state-changing commands
 │   │   ├── file_agent_node.py  # Workspace file CRUD, search by name/extension
-│   │   ├── rag_agent_node.py   # Semantic file search + web search
+│   │   ├── web_search_agent_node.py  # Web_search 
+│   │   ├── rag_agent_node.py   # Semantic file search
 │   │   └── general_result_agent_node.py  # Conversation, Q&A, capability help
 │   ├── file_manager.py         # File reading/writing, markdown→docx, indexing, tree-sitter, watchdog
 │   ├── memory.py               # SQLite conversation history and semantic memory retrieval
@@ -383,8 +384,8 @@ User input (typed or voice)
    LangGraph Supervisor
    (classifies intent → routes to specialist agent)
         ↓
-   ┌──────────┬──────────────┬─────────────┬───────────┬──────────────┐
-   ppt_agent  window_agent  shell_agent  file_agent  rag_agent  general_agent
+   ┌──────────┬──────────────┬─────────────┬───────────┬──────────┬───────────┐
+   ppt_agent  window_agent  shell_agent  file_agent  rag_agent  web_search   general_agent
         ↓
    Agent executes its tools:
    pycaw / pyautogui / subprocess / sbc / psutil / win32api / win32gui
@@ -519,7 +520,7 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 - [ ] Resolution switching
 - [ ] System shutdown / restart / sleep commands
 - [ ] WhatsApp and other UWP app process name alias map
-- [ ] Per-app volume control (set Spotify to 40% without touching system volume)
+- [✔️] Per-app volume control (set Spotify to 40% without touching system volume)
 
 ### Medium Term
 - [ ] Scheduled actions ("mute at 11pm every night") via APScheduler

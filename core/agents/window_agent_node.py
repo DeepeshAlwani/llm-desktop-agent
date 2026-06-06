@@ -28,6 +28,7 @@ from typing import Any
 from langchain_ollama import ChatOllama
 from langchain.agents import create_agent
 from langgraph.types import Command
+from langchain_core.messages import AIMessage
 
 from tools import (
     # ── audio ────────────────────────────────────────────────────────────
@@ -46,6 +47,8 @@ from tools import (
     kill_process,
     # ── window layout ─────────────────────────────────────────────────────
     resize_window,
+    get_available_resolutions,
+    set_resolution,
     # ── profiles ──────────────────────────────────────────────────────────
     save_profile,
     del_profile,
@@ -70,6 +73,9 @@ RULES:
 - Apps in system tray appear in BACKGROUND/TRAY PROCESSES, not VISIBLE WINDOWS.
   Use kill_process for tray apps, set_active_window for visible windows.
 - For resize/snap: prefer named presets (left-half, right-half, top-left, etc.)
+- For resolution changes: always call list_resolutions first,
+  present the numbered list to the user, then wait for their
+  selection before calling set_resolution.
 
 CRITICAL:
 - Never invent information not returned by a tool.
@@ -82,7 +88,7 @@ CRITICAL:
 
 _TOOLS = [
     volume_control, mute_device, pause_media, get_current_volume,
-    get_screen_brightness, adjust_screen_brightness,
+    get_screen_brightness, adjust_screen_brightness, get_available_resolutions, set_resolution,
     set_active_window, open_application, get_installed_apps_tool,
     get_running_apps, kill_process, resize_window,
     save_profile, del_profile, read_profile, list_all_saved_profiles_names,
@@ -99,8 +105,12 @@ def window_agent_node(state: dict[str, Any]) -> Command:
         history.append({"role": "user", "content": task})
 
     response = agent.invoke({"messages": history})
-    raw      = response["messages"][-1]
-    result   = raw.content if hasattr(raw, "content") else str(raw)
+    raw = next(
+        (m for m in reversed(response["messages"]) 
+        if isinstance(m, AIMessage) and isinstance(m.content, str) and m.content.strip()),
+        None
+    )
+    result = raw.content.strip() if raw else "Action completed."
 
     # ── Delegation: bounce out-of-scope requests to supervisor ────────────────
     match = re.search(r"<needs_specialist>(.*?)</needs_specialist>", result, re.DOTALL)

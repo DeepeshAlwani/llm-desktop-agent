@@ -13,6 +13,8 @@ The graph (agents/graph.py) routes automatically:
   - Everything else        → system_agent_node
 """
 
+from genericpath import exists
+
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -450,6 +452,8 @@ while True:
         f"({pct*100:.0f}%) — {CONTEXT_WINDOW - used:,} tokens remaining[/dim]"
     )
 
+    context_lines = ""
+
     if similar:
         context_lines = "\n".join(
             f"[Past {m['role']}]: {m['content']}"
@@ -461,7 +465,7 @@ while True:
                 {"role": "system",
                  "content": f"RELEVANT PAST CONTEXT:\n{context_lines}"}
             ] + trimmed
-
+    
     new_messages = []
     if context_lines:
         new_messages.append({"role": "system", "content": f"RELEVANT PAST CONTEXT:\n{context_lines}"})
@@ -482,7 +486,15 @@ while True:
     )
 
     if assistant_message:
-        response_text = assistant_message.content.strip()
+        content = assistant_message.content
+        if isinstance(content, list):
+            # extract text parts only
+            response_text = " ".join(
+                part["text"] for part in content 
+                if isinstance(part, dict) and part.get("type") == "text"
+            ).strip()
+        else:
+            response_text = content.strip()
     else:
         response_text = "Action completed."
 
