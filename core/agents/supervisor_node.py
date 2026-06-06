@@ -24,6 +24,7 @@ Shared state keys used:
 """
 
 from __future__ import annotations
+import re
 from typing import Any
 
 from langchain_ollama import ChatOllama
@@ -69,7 +70,45 @@ def supervisor_node(state: dict[str, Any]) -> Command:
     """
     messages = state.get("messages", [])
 
-    # ── 1. PPT clarification question pending ─────────────────────────────────
+    # ── 1a. Research summary ready — show to user, then wait ─────────────────
+    _REVIEW_PREFIX = "Here's the research outline for your presentation."
+    awaiting = state.get("ppt_awaiting_approval", False)
+
+    # Determine whether the last message is from the user (they've already replied)
+    # or from the assistant (we just set the flag and are waiting for their reply).
+    last_message = messages[-1] if messages else None
+    last_is_user = last_message and isinstance(last_message, HumanMessage)
+    last_is_ai   = last_message and isinstance(last_message, AIMessage)
+
+    if awaiting and last_is_ai:
+        # Flag is set AND the last message is ours — user hasn't replied yet.
+        # Re-surface the summary (e.g. if called again before user responds).
+        research = state.get("ppt_research_data", {})
+        slides   = research.get("slides", [])
+        title    = research.get("presentation_title", "Your Presentation")
+        palette  = research.get("palette", "Technology")
+        lines    = [f"**{title}**  *(Theme: {palette})*", ""]
+        for i, s in enumerate(slides, 1):
+            lines.append(f"**Slide {i}: {s['title']}**")
+            for f in s.get("facts", []):
+                lines.append(f"  • {f}")
+            lines.append("")
+        summary = "\n".join(lines).strip()
+        reply   = (
+            _REVIEW_PREFIX + " "
+            "Let me know if anything needs to change — or say **looks good** to start building.\n\n"
+            + summary
+        )
+        return Command(
+            update={
+                "messages": list(messages) + [{"role": "assistant", "content": reply}],
+            },
+            goto="__end__",
+        )
+    # If awaiting=True but last_is_user=True, fall through to the routing section
+    # below where the approval guard will fire and route to ppt_agent.
+
+    # ── 1b. PPT clarification question pending ────────────────────────────────
     pending_q = state.get("ppt_pending_question")
     if pending_q:
         reply = f"[Presentation agent asks]: {pending_q}"
@@ -99,9 +138,9 @@ def supervisor_node(state: dict[str, Any]) -> Command:
     if not messages:
         return Command(update={}, goto="__end__")
 
-    # NEW GUARD — if the last real message is already an AI response, we're done
-    last_message = messages[-1] if messages else None
-    if last_message and isinstance(last_message, AIMessage):
+    # If the last message is already AI and we're NOT awaiting approval
+    # (which would have been caught above), there's nothing to do.
+    if last_is_ai and not awaiting:
         return Command(update={}, goto="__end__")
 
     last_user_msg = next(
@@ -112,7 +151,32 @@ def supervisor_node(state: dict[str, Any]) -> Command:
     # Also guard against empty user message reaching the LLM
     if not last_user_msg.strip():
         return Command(update={}, goto="__end__")
-    
+
+    # ── Research review in-progress: user's reply routes straight to ppt_agent ─
+    # At this point last_is_user=True (we fell through from the display block above),
+    # so if awaiting is still set the user has just replied to our review summary.
+    if awaiting:
+        print(f"[supervisor] research approval/feedback received → ppt_agent")
+        return Command(
+            update={
+                "ppt_research_feedback": last_user_msg,
+                "next": "ppt_agent",
+            },
+            goto="ppt_agent",
+        )
+
+    # ── Clarification in-progress: answer goes straight back to ppt_agent ────
+    # MUST be checked BEFORE LLM routing — otherwise the final return overwrites
+    # ppt_task with just the short answer, discarding the original task context.
+    if state.get("ppt_clarification_round", 0) > 0:
+        original_task = state.get("ppt_task", "")
+        enriched_task = f"{original_task}\n[User clarification: {last_user_msg}]"
+        print(f"[supervisor] clarification answer received → ppt_agent")
+        return Command(
+            update={"ppt_task": enriched_task, "next": "ppt_agent"},
+            goto="ppt_agent",
+        )
+
     # Tiny context — just classify, no tool calls needed
     llm = ChatOllama(model="llama3.2:3b", num_ctx=512)
     routing_response = llm.invoke([
@@ -141,6 +205,21 @@ def supervisor_node(state: dict[str, Any]) -> Command:
     print(f"[supervisor] '{last_user_msg[:70]}' → {destination}")
 
     task_key = destination.replace("_agent", "_task")   # e.g. "ppt_task", "window_task"
+
+    _CONVERT_PATTERNS = r"\b(save|convert|make|turn|export|create|build|generate)\b.{0,40}\b(ppt|powerpoint|presentation|slides|deck)\b"
+    # Only apply the "use prior AI content" override on a truly fresh ppt request —
+    # never while we're mid-review, or the task becomes the giant summary blob.
+    if (destination == "ppt_agent"
+            and not state.get("ppt_awaiting_approval")
+            and re.search(_CONVERT_PATTERNS, last_user_msg, re.IGNORECASE)):
+        last_ai_content = next(
+            (m.content for m in reversed(messages) if isinstance(m, AIMessage)),
+            "",
+        )
+        if last_ai_content and len(last_ai_content) > 100:
+            last_user_msg = (
+                f"Create a PowerPoint presentation using this content:\n\n{last_ai_content}"
+            )
 
     # ── Bounce-loop guard ─────────────────────────────────────────────────────
     bounce_count = state.get("bounce_count", 0)

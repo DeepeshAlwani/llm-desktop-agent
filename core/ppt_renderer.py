@@ -105,7 +105,8 @@ def _set_bg(slide, color_hex: str) -> None:
 
 def _draw_rect(slide, el: dict) -> None:
     shape = slide.shapes.add_shape(
-        1, Inches(el["l"]), Inches(el["t"]), Inches(el["w"]), Inches(el["h"])
+        1, Inches(el.get("l", 0)), Inches(el.get("t", 0)),
+        Inches(el.get("w", 1)), Inches(el.get("h", 1))
     )
     shape.fill.solid()
     shape.fill.fore_color.rgb = _rgb(el["color"])
@@ -117,7 +118,8 @@ def _draw_rect(slide, el: dict) -> None:
 
 def _draw_text(slide, el: dict) -> None:
     tb = slide.shapes.add_textbox(
-        Inches(el["l"]), Inches(el["t"]), Inches(el["w"]), Inches(el["h"])
+        Inches(el.get("l", 0)), Inches(el.get("t", 0)),
+        Inches(el.get("w", 6)), Inches(el.get("h", 1))
     )
     tf = tb.text_frame
     tf.word_wrap = True
@@ -134,7 +136,8 @@ def _draw_text(slide, el: dict) -> None:
 
 def _draw_bullets(slide, el: dict) -> None:
     tb = slide.shapes.add_textbox(
-        Inches(el["l"]), Inches(el["t"]), Inches(el["w"]), Inches(el["h"])
+        Inches(el.get("l", 0)), Inches(el.get("t", 0)),
+        Inches(el.get("w", 6)), Inches(el.get("h", 5))
     )
     tf = tb.text_frame
     tf.word_wrap = True
@@ -157,8 +160,8 @@ def _draw_image(slide, el: dict) -> None:
     if buf:
         try:
             slide.shapes.add_picture(
-                buf, Inches(el["l"]), Inches(el["t"]),
-                Inches(el["w"]), Inches(el["h"])
+                buf, Inches(el.get("l", 0)), Inches(el.get("t", 0)),
+                Inches(el.get("w", 5)), Inches(el.get("h", 4))
             )
             return
         except Exception:

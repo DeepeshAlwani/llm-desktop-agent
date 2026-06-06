@@ -45,7 +45,7 @@ except ImportError:
 
 import tiktoken
 
-TTS_AVAILABLE = False
+VOICE_AVAILABLE = False
 
 # ── Multi-agent graph (replaces the single `agent`) ──────────────────────────
 from agents.graph import get_app
@@ -462,10 +462,18 @@ while True:
                  "content": f"RELEVANT PAST CONTEXT:\n{context_lines}"}
             ] + trimmed
 
+    new_messages = []
+    if context_lines:
+        new_messages.append({"role": "system", "content": f"RELEVANT PAST CONTEXT:\n{context_lines}"})
+    new_messages.append({"role": "user", "content": user_input})
+
     # ── Invoke multi-agent graph (replaces agent.invoke) ─────────────────────
     with console.status("[dim]thinking...[/dim]", spinner="dots"):
-        result = app.invoke({"messages": trimmed})
-
+        result = app.invoke(
+                                {"messages": new_messages},
+                                config={"configurable": {"thread_id": SESSION_ID}},
+                            )
+    
     # Extract the last assistant message from the returned state
     result_messages = result.get("messages", [])
     assistant_message = next(

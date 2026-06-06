@@ -410,7 +410,7 @@ def write_pptx(filepath: str, spec: dict) -> str:
 
 
 def _get_conn():
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(DB_PATH, timeout=15)
 
 embedder = OllamaEmbeddings(model="nomic-embed-text-v2-moe")
 

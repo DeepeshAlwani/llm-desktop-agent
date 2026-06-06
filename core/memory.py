@@ -9,7 +9,7 @@ embedder = OllamaEmbeddings(model="nomic-embed-text-v2-moe")
 
 
 def _get_conn():
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(DB_PATH, timeout=15)
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     # dot product divided by product of magnitudes

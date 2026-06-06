@@ -30,6 +30,7 @@ from typing_extensions import TypedDict
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
 
 from agents.supervisor_node    import supervisor_node
 from agents.ppt_agent_node     import ppt_agent_node
@@ -59,6 +60,11 @@ class AgentState(TypedDict, total=False):
     ppt_pending_question:    str | None
     ppt_clarification_round: int
 
+    # Research-review handshake (persisted across turns via checkpointer)
+    ppt_research_data:     dict | None   # stashed after research, cleared after design
+    ppt_awaiting_approval: bool          # True while waiting for user to approve/edit
+    ppt_research_feedback: str | None    # user's reply to the research summary
+
     window_task:   str
     window_result: str | None
 
@@ -79,24 +85,29 @@ class AgentState(TypedDict, total=False):
 
 def build_graph():
     """
-    Build and compile the multi-agent graph.
-    All routing is dynamic (Command-based), so only node declarations needed —
-    no static conditional edges.
+    Build and compile the multi-agent graph with an in-memory checkpointer.
+
+    The checkpointer is REQUIRED for multi-turn flows (PPT clarification,
+    research review) — without it, all state except `messages` is wiped
+    between turns and approval flags are lost.
     """
     builder = StateGraph(AgentState)
 
-    builder.add_node("supervisor",    supervisor_node)
-    builder.add_node("ppt_agent",     ppt_agent_node)
-    builder.add_node("window_agent",  window_agent_node)
-    builder.add_node("shell_agent",   shell_agent_node)
-    builder.add_node("file_agent",    file_agent_node)
-    builder.add_node("rag_agent",          rag_agent_node)
+    builder.add_node("supervisor",       supervisor_node)
+    builder.add_node("ppt_agent",        ppt_agent_node)
+    builder.add_node("window_agent",     window_agent_node)
+    builder.add_node("shell_agent",      shell_agent_node)
+    builder.add_node("file_agent",       file_agent_node)
+    builder.add_node("rag_agent",        rag_agent_node)
     builder.add_node("web_search_agent", web_search_agent_node)
-    builder.add_node("general_agent", general_agent_node)
+    builder.add_node("general_agent",    general_agent_node)
 
     builder.set_entry_point("supervisor")
 
-    return builder.compile()
+    # MemorySaver keeps state in-process (no DB needed).
+    # Each conversation must pass config={"configurable": {"thread_id": <id>}}
+    checkpointer = MemorySaver()
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ── Cached singleton ───────────────────────────────────────────────────────────
@@ -109,3 +120,36 @@ def get_app():
     if _app is None:
         _app = build_graph()
     return _app
+
+
+# ── Thread config helper ───────────────────────────────────────────────────────
+
+_DEFAULT_THREAD = {"configurable": {"thread_id": "main"}}
+
+def invoke(user_message: str, thread_id: str = "main") -> str:
+    """
+    Convenience wrapper used by call_ollama.py.
+
+    IMPORTANT: always pass the same thread_id for the same conversation so the
+    checkpointer can restore state (ppt_awaiting_approval, ppt_research_data…)
+    between turns.  Use a different thread_id to start a fresh session.
+
+    Example:
+        from agents.graph import invoke
+        reply = invoke("make a ppt about solar energy")
+        reply2 = invoke("looks good, proceed")   # same thread — state preserved
+    """
+    app    = get_app()
+    config = {"configurable": {"thread_id": thread_id}}
+    result = app.invoke(
+        {"messages": [{"role": "user", "content": user_message}]},
+        config=config,
+    )
+    msgs = result.get("messages", [])
+    # Return the last assistant message
+    for m in reversed(msgs):
+        content = m.content if hasattr(m, "content") else m.get("content", "")
+        role    = getattr(m, "type", None) or m.get("role", "")
+        if role in ("ai", "assistant") and content:
+            return content
+    return ""
