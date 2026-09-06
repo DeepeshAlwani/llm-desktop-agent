@@ -38,6 +38,7 @@ from langchain_ollama import ChatOllama
 from langchain.agents import create_agent
 from langgraph.types import Command
 
+from config import MODEL, NUM_CTX
 from tools import search_file_content
 from datetime import datetime
 
@@ -84,7 +85,7 @@ def rag_agent_node(state: dict[str, Any]) -> Command:
     import re
     task    = state.get("rag_task", "")
     # Slightly larger context here — RAG responses can be long
-    llm     = ChatOllama(model="granite4.1:8b", num_ctx=12288)
+    llm     = ChatOllama(model=MODEL, num_ctx=NUM_CTX*4)
     agent   = create_agent(model=llm, tools=_TOOLS, system_prompt=_PROMPT)
 
     history = list(state.get("messages", []))

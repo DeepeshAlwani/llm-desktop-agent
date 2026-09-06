@@ -28,6 +28,8 @@ from langchain_ollama import ChatOllama
 from langgraph.types import Command
 from datetime import datetime
 
+from config import MODEL, NUM_CTX
+
 _PROMPT = f"""You are the front-facing assistant of a Windows desktop AI agent system.
 You handle conversation, answer questions about the system's capabilities, and help
 the user figure out what to ask.
@@ -116,7 +118,7 @@ def general_agent_node(state: dict[str, Any]) -> Command:
     import re
 
     task    = state.get("general_task", "")
-    llm     = ChatOllama(model="granite4.1:8b", num_ctx=4096)
+    llm     = ChatOllama(model=MODEL, num_ctx=NUM_CTX)
 
     agent = create_agent(
         model=llm,

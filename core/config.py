@@ -1,0 +1,2 @@
+MODEL="ornith-1.5:9b"
+NUM_CTX=8192

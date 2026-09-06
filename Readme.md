@@ -19,7 +19,7 @@
 
 `llm-desktop-agent` is a fully local AI agent that lets you control your Windows machine through natural language. Ask it to adjust your volume, change screen brightness, open apps, manage profiles, close processes, query system info, read and write files in your workspace, create presentations, or search the web — all without touching the cloud.
 
-It uses [Ollama](https://ollama.com) to run LLMs locally on your hardware and [LangGraph](https://langchain-ai.github.io/langgraph/) to orchestrate a **multi-agent system** where a supervisor routes each request to a dedicated specialist agent. The terminal interface is built with [Rich](https://github.com/Textualize/rich) for clean formatted output, and a live system monitor is available via [Textual](https://github.com/Textualize/textual).
+It uses [Ollama](https://ollama.com) to run LLMs locally on your hardware and [LangGraph](https://langchain-ai.github.io/langgraph/) to orchestrate a **multi-agent system**. Rather than a single-shot router, a supervisor first **plans** your request into an ordered list of agent steps, executes them one by one, has a **judge** grade each step's output and retry it with feedback if it falls short, and runs a **final review** against your original goal before the turn ends — with a full markdown transcript of the plan, every step, and every verdict logged for each turn. The terminal interface is built with [Rich](https://github.com/Textualize/rich) for clean formatted output, and a live system monitor is available via [Textual](https://github.com/Textualize/textual).
 
 ```
 You: apply my gaming profile
@@ -106,7 +106,11 @@ Supported file types for reading and indexing:
 Code files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, and more) are semantically chunked at the function/method level using [tree-sitter](https://tree-sitter.github.io/tree-sitter/) when the grammar package is installed, falling back to overlapping line chunks otherwise.
 
 ### Intelligence
-- **Multi-agent routing** — a LangGraph supervisor classifies every request and dispatches it to the right specialist agent; each agent has a focused context and tool set rather than one monolithic prompt with 20+ tools
+- **Multi-step planning** — `supervisor_node` no longer just routes a request to one agent; it plans it into an ordered list of steps, each assigned to the specialist agent best suited to handle it, based on the user's overall intent
+- **Quality-judged execution** — every step's output is graded by `judge_node`; a failing step is retried by the same agent (up to 3 attempts) with the judge's feedback appended, and if it still fails after 3 tries the supervisor is called back in to reframe the step, hand it to a different agent, or tell the user the task couldn't be completed
+- **Final review** — once every planned step is done, `final_review_node` checks the overall result against the user's original goal; if it falls short, the plan is regenerated from scratch with feedback about what went wrong, rather than silently returning an incomplete answer
+- **Context folding between steps** — `plan_utils` carries forward the relevant results of earlier steps into later ones in the same plan, so a multi-agent task (e.g. research → write file → build slides) flows with shared context instead of each agent working blind
+- **Per-turn run transcripts** — `run_logger` writes a detailed markdown log for every user turn, capturing the generated plan, each agent's raw output, every judge verdict (and retries), and the final review outcome — useful for debugging and understanding exactly how a response was produced
 - **Profile system** — save and load named configurations with multiple apps, optional URLs per app, volume and brightness (e.g. "study", "gaming", "focus")
 - **Multi-step reasoning** — one request chains multiple tools automatically within the responsible agent
 - **System awareness** — checks if apps are already running before opening, detects tray vs visible windows, verifies actions with follow-up tool calls
@@ -115,13 +119,14 @@ Code files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, and more) are sem
 - **Command safety layer** — blocklist of destructive operations (`del`, `format`, `reg delete`, `diskpart`, symlink creation, script file writes, etc.) refused regardless of how they're requested; separate confirmation gate for shutdown, restart, `winget install/uninstall`, and network changes
 - **Persistent memory** — SQLite-backed conversation history with semantic retrieval; past relevant exchanges are injected into context automatically using cosine similarity scoring
 - **Context window tracking** — tiktoken token count is displayed before every agent call, colour-coded green/yellow/red and showing tokens remaining against the model's 131,072-token context window
+- **Centralized model configuration** — `core/config.py` holds the model name and context-window (`num_ctx`) settings used across agents, instead of each node hardcoding its own
 
 ### Presentation Creation
 
 The agent can generate fully-designed `.pptx` files autonomously. Say things like _"make me a presentation on climate change"_ or _"create a 7-slide deck on Python for beginners"_ and it will produce a polished file in your workspace.
 
 - **`call_ppt_agent`** — a dedicated sub-agent (`ppt_agent.py`) runs the entire pipeline independently
-- The LLM outputs a structured **XML spec** containing a custom colour palette and slide-by-slide content
+- The LLM outputs a structured **JSON spec** (previously XML — switched for more reliable parsing) containing a custom colour palette and slide-by-slide content, and each step is graded by the judge before the deck is finalized
 - **7 available layouts**: `title`, `section`, `content`, `two_column`, `image_right`, `big_stat`, `closing`
 - **Per-element rich text** — every heading, subheading, and bullet item supports `bold`, `italic`, `size`, and `align` attributes
 - **LLM-generated palettes** — the model invents a colour scheme that matches the topic's mood (e.g. saffron + green for India, teal + deep blue for ocean/science)
@@ -279,7 +284,7 @@ Ollama's default context window is **4096 tokens** regardless of the model's act
 
 ```python
 from langchain_ollama import ChatOllama
-llm = ChatOllama(model="granite4.1:8b", num_ctx=16384)
+llm = ChatOllama(model=MODEL, num_ctx=NUM_CTX*2)
 ```
 
 16,384 tokens is more than sufficient for the clarification loop and leaves comfortable headroom. Using the full 131,072 is possible but significantly increases VRAM usage — not recommended unless you have 16GB+ VRAM.
@@ -334,11 +339,16 @@ The assistant uses always-on voice activation — just say **"hello"** to wake i
 llm-desktop-agent/
 ├── core/
 │   ├── call_ollama.py          # Agent loop, conversation management, Rich rendering, voice input
+│   ├── config.py               # Centralized per-agent model name and context-window (num_ctx) settings
 │   ├── tools.py                # All LangChain tool definitions
+│   ├── plan_utils.py           # Plan state management, step advancement, context folding between steps
+│   ├── run_logger.py           # Writes a markdown transcript (plan, steps, judge verdicts) per user turn
 │   ├── agents/
 │   │   ├── graph.py            # LangGraph StateGraph — wires all nodes into a compiled graph
-│   │   ├── supervisor_node.py  # Routing supervisor — classifies each request and dispatches it
-│   │   ├── ppt_agent_node.py   # PowerPoint creation pipeline
+│   │   ├── supervisor_node.py  # Planner — turns each request into an ordered list of agent steps
+│   │   ├── judge_node.py       # Grades judgable agent output; drives retries with feedback
+│   │   ├── final_review_node.py# Reviews the completed plan against the original user goal
+│   │   ├── ppt_agent_node.py   # PowerPoint creation pipeline (JSON spec, judge-reviewed)
 │   │   ├── window_agent_node.py# Desktop control: audio, brightness, apps, window layout, profiles
 │   │   ├── shell_agent_node.py # Shell/CMD access: queries and state-changing commands
 │   │   ├── file_agent_node.py  # Workspace file CRUD, search by name/extension
@@ -363,7 +373,7 @@ llm-desktop-agent/
 └── README.md
 ```
 
-The supervisor routes each user message to exactly one specialist agent. Each agent operates with its own focused system prompt and tool set — no agent sees tools it doesn't need. This keeps context windows lean and routing accurate.
+Every user request is planned into an ordered list of steps up front, and each step is dispatched to exactly one specialist agent. Each agent still operates with its own focused system prompt and tool set — no agent sees tools it doesn't need — which keeps context windows lean and each step's execution accurate. Every step's result then passes through the judge before the plan is allowed to advance.
 
 ---
 
@@ -381,23 +391,43 @@ User input (typed or voice)
    Semantic memory retrieval
    (past relevant exchanges injected into context)
         ↓
-   LangGraph Supervisor
-   (classifies intent → routes to specialist agent)
+   supervisor_node — PLANNER
+   (breaks the request into an ordered list of steps,
+    each assigned to a specialist agent)
         ↓
-   ┌──────────┬──────────────┬─────────────┬───────────┬──────────┬───────────┐
-   ppt_agent  window_agent  shell_agent  file_agent  rag_agent  web_search   general_agent
+   ┌────────────────────── For each step in the plan ──────────────────────┐
+   │                                                                        │
+   │   ┌──────────┬──────────────┬─────────────┬───────────┬──────────┬───────────┐
+   │   ppt_agent  window_agent  shell_agent  file_agent  rag_agent  web_search   general_agent
+   │        ↓                                                                     │
+   │   Agent executes its tools:                                                  │
+   │   pycaw / pyautogui / subprocess / sbc / psutil / win32api / win32gui        │
+   │   file_manager / sqlite / watchdog / tree-sitter / ollama embeddings         │
+   │   ppt_renderer (presentation pipeline)                                       │
+   │        ↓                                                                     │
+   │   judge_node — grades the step's output                                     │
+   │        ↓                                                            ┌─ fail ─┤
+   │      pass                                                           │        │
+   │        ↓                                              retry same agent       │
+   │   plan_utils folds this step's result                  with judge feedback   │
+   │   into context for the next step                       (up to 3 attempts)   │
+   │        ↓                                                                     │
+   │   (still failing after 3 tries → back to supervisor_node to reframe          │
+   │    the step, hand it to a different agent, or report failure to the user)   │
+   └────────────────────────────────────────────────────────────────────────────┘
         ↓
-   Agent executes its tools:
-   pycaw / pyautogui / subprocess / sbc / psutil / win32api / win32gui
-   file_manager / sqlite / watchdog / tree-sitter / ollama embeddings
-   ppt_renderer (presentation pipeline)
+   final_review_node
+   (checks the completed plan against the ORIGINAL user goal)
         ↓
-   Supervisor surfaces result
+      fail → re-plan from scratch, with feedback on what went wrong ──┐
+        ↓ pass                                                        │
+   run_logger writes the full markdown transcript                     │
+   (plan, every step, every judge verdict, final review) ←────────────┘
         ↓
    Rich-formatted response to user
 ```
 
-The LLM never directly touches your system or files. It outputs structured tool calls, and Python executes them. Every action is inspectable, restrictable, and extensible.
+The LLM never directly touches your system or files. It outputs structured tool calls, and Python executes them. Every action is inspectable, restrictable, and extensible — and now every step of that process is planned, graded, and logged before the final answer reaches you.
 
 ---
 
@@ -472,7 +502,7 @@ The PPT pipeline:
 
 1. The sub-agent (`ppt_agent.py`) asks up to 2 clarifying questions to understand audience, topic depth, and format — then proceeds automatically
 2. The LLM searches the web via SearXNG (with Wikipedia fallback) to gather factual content before writing each slide
-3. The LLM produces a `<presentation>` XML block with a custom colour palette and one `<slide>` per slide, with per-element rich text formatting
+3. The LLM produces a structured JSON spec with a custom colour palette and one slide object per slide, with per-element rich text formatting
 4. Images are fetched via Pixabay and Unsplash using `image_search.py` and embedded directly into the `.pptx`
 5. `ppt_renderer.py` converts the spec into a proper `.pptx` file using python-pptx, with automatic contrast violation fixes
 6. The finished file is saved to `agent_workspace/` and indexed for semantic search
@@ -516,6 +546,11 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 - [✔️] Presentation creation — full `.pptx` generation with LLM-designed palettes, SearXNG/Wikipedia web research, and Pixabay/Unsplash images
 - [✔️] Markdown → Word document writing (headings, bullets, tables via python-docx)
 - [✔️] Context window tracking — token count displayed per turn with colour-coded usage
+- [✔️] Multi-step planning — supervisor plans requests into an ordered list of agent steps instead of single-shot routing
+- [✔️] Quality judging with retries — judge_node grades each step and retries with feedback before escalating back to the supervisor
+- [✔️] Final review against the original goal — final_review_node can trigger a full re-plan if the completed plan falls short
+- [✔️] Per-turn markdown run transcripts (plan, steps, judge verdicts, final review) via run_logger
+- [✔️] Centralized model/config settings via core/config.py
 - [ ] Night light toggle via Windows registry
 - [ ] Resolution switching
 - [ ] System shutdown / restart / sleep commands
@@ -532,7 +567,7 @@ Keyboard shortcuts: `q` quit, `r` refresh processes, `d` toggle dark/light theme
 
 ### Long Term
 - [ ] Native Windows GUI using PySide6 (no Electron, no web wrapper)
-- [✔️] LangGraph multi-agent system — supervisor routes to specialist agents (ppt, window, shell, file, rag, general)
+- [✔️] LangGraph multi-agent system — supervisor plans and dispatches to specialist agents (ppt, window, shell, file, rag, web_search, general), with judge and final-review quality control
 - [ ] Plugin system so users can add tools without modifying core files
 - [ ] Auto-discovery of user preferences over time
 
@@ -553,7 +588,7 @@ Contributions are very welcome.
 ### What to Contribute
 
 - **New tools** — anything controllable via Python on Windows. Add in `tools.py` with the `@tool` decorator and a clear docstring, then wire it into the appropriate agent node.
-- **New agents** — have a capability that doesn't fit any existing agent? Add a new node in `agents/`, register it in `graph.py`, and add a routing token to `supervisor_node.py`.
+- **New agents** — have a capability that doesn't fit any existing agent? Add a new node in `agents/`, register it in `graph.py`, teach `supervisor_node.py`'s planner to assign it steps, and add it to `judge_node.py`'s judgable list if its output benefits from quality grading and retries.
 - **Bug fixes** — especially around app launching, process detection, or COM audio edge cases
 - **Model testing** — tested a model not in the recommended list? Open a PR updating the table
 - **App aliases** — know the real process name for a common app? Add it to `APP_ALIASES` in `tools.py`

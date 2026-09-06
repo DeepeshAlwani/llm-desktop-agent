@@ -29,6 +29,7 @@ from langchain_ollama import ChatOllama
 from langchain.agents import create_agent
 from langgraph.types import Command
 from langchain_core.messages import AIMessage
+from config import MODEL, NUM_CTX
 
 from tools import (
     # ── audio ────────────────────────────────────────────────────────────
@@ -97,7 +98,7 @@ _TOOLS = [
 
 def window_agent_node(state: dict[str, Any]) -> Command:
     task    = state.get("window_task", "")
-    llm     = ChatOllama(model="granite4.1:8b", num_ctx=8192)
+    llm     = ChatOllama(model=MODEL, num_ctx=NUM_CTX)
     agent   = create_agent(model=llm, tools=_TOOLS, system_prompt=_PROMPT)
 
     history = list(state.get("messages", []))
@@ -105,6 +106,8 @@ def window_agent_node(state: dict[str, Any]) -> Command:
         history.append({"role": "user", "content": task})
 
     response = agent.invoke({"messages": history})
+    for m in response["messages"]:
+        print(f"[DEBUG] type={type(m).__name__} content={repr(m.content)[:200]}")
     raw = next(
         (m for m in reversed(response["messages"]) 
         if isinstance(m, AIMessage) and isinstance(m.content, str) and m.content.strip()),
@@ -130,3 +133,5 @@ def window_agent_node(state: dict[str, Any]) -> Command:
         update={"messages": history, "window_result": result, "next": "supervisor"},
         goto="supervisor",
     )
+
+

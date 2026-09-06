@@ -10,13 +10,14 @@ do any LLM work itself — it coordinates three focused sub-agents in sequence:
   2. ppt_research_agent  — calls web_search to gather facts per slide topic
                            returns structured JSON: {slides: [{title, facts[]}]}
 
-  3. ppt_design_agent    — turns research JSON into <presentation> XML
-                           uses only the format rules + worked example
-                           no knowledge-doc dump, no web tools
+  3. ppt_design_agent    — turns research JSON into a complete presentation:
+                           rewrites facts into bullet copy, picks a layout
+                           per slide from a pattern library (or invents one),
+                           and outputs it as JSON matching render_pptx's
+                           native schema directly — no intermediate markup.
 
-  4. ppt_image_agent     — scans slides_data for image opportunities,
-                           calls image_search_tool, injects image elements
-                           (pure Python loop — no LLM needed)
+Image fetching happens automatically inside ppt_renderer.render_pptx for any
+slide with an `image` element — no separate image agent needed.
 
 Then renders → saves → indexes.
 
@@ -43,14 +44,14 @@ from langgraph.types import Command
 from datetime import datetime
 from langchain_core.messages import AIMessage
 from tools import web_search
-from image_search import image_search_tool
 from file_manager import WATCHED_FOLDER, index_file
 from ppt_renderer import render_pptx
+from config import MODEL, NUM_CTX
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 
 _CORE = Path(__file__).parent.parent          # …/core/
-_FORMAT_RULES_PATH = _CORE / "ppt_format_rules.md"   # new slim file (see below)
+_FORMAT_RULES_PATH = _CORE / "ppt_format_rules.md"
 
 # ─── Logging ──────────────────────────────────────────────────────────────
 
@@ -63,12 +64,45 @@ _fh.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S
 _ppt_logger.addHandler(_fh)
 
 
-
 def _load_format_rules() -> str:
     try:
         return _FORMAT_RULES_PATH.read_text(encoding="utf-8")
     except Exception:
         return ""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Shared helper — extract a JSON object from an LLM response, with repair
+# for truncated output. Used by both the research and design agents.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _extract_json(raw: str) -> dict | None:
+    """Pulls a JSON object out of raw LLM text, tolerating code fences and
+    (within reason) truncated output cut off mid-array."""
+    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    json_str = raw[start:end + 1]
+
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+
+    # Repair attempt: trim back to the last fully-closed object in whatever
+    # array we're inside, then close whatever brackets are still open.
+    last_complete = json_str.rfind("},")
+    if last_complete <= 0:
+        return None
+    trimmed = json_str[:last_complete + 1]
+    open_brackets = trimmed.count("[") - trimmed.count("]")
+    open_braces   = trimmed.count("{") - trimmed.count("}")
+    trimmed += "]" * max(0, open_brackets) + "}" * max(0, open_braces)
+    try:
+        return json.loads(trimmed)
+    except json.JSONDecodeError:
+        return None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -99,11 +133,17 @@ Only ask if a factual gap would make the deck incorrect.
 
 def _run_clarify_agent(task: str) -> str | None:
     """Returns a clarifying question string, or None if task is clear."""
-    llm = ChatOllama(model="granite4.1:8b", num_ctx=1024)
-    response = llm.invoke([
-        {"role": "system", "content": _CLARIFY_SYSTEM},
-        {"role": "user",   "content": task},
-    ])
+    llm = ChatOllama(model=MODEL, num_ctx=int(NUM_CTX / 5))
+    try:
+        response = llm.invoke([
+            {"role": "system", "content": _CLARIFY_SYSTEM},
+            {"role": "user",   "content": task},
+        ])
+    except Exception as e:
+        print(f"[ppt_clarify] Invocation failed, skipping clarification: {e}")
+        _ppt_logger.debug("── CLARIFY INVOKE ERROR ──\n%s\n", e)
+        return None
+
     raw = str(response.content).strip()
     _ppt_logger.debug("── CLARIFY ──\n%s\n", raw)
     m = re.search(r"<question>(.*?)</question>", raw, re.DOTALL)
@@ -145,134 +185,48 @@ RULES:
 
 def _run_research_agent(task: str) -> dict | None:
     """Runs web research and returns structured dict, or None on failure."""
-    llm   = ChatOllama(model="granite4.1:8b", num_ctx=8192)
+    llm   = ChatOllama(model=MODEL, num_ctx=NUM_CTX)
     agent = create_agent(
         model=llm,
         tools=[web_search],
         system_prompt=_build_research_prompt(task),
     )
 
-    response = agent.invoke({"messages": [{"role": "user", "content": task}]})
-    raw_msg  = response["messages"][-1]
-    raw      = raw_msg.content if hasattr(raw_msg, "content") else str(raw_msg)
-
-    # Strip markdown fences if model wrapped JSON in ```
-    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
-
-    # Find JSON object — try from first { to last } for best coverage
-    start = raw.find("{")
-    end   = raw.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        print(f"[ppt_research] No JSON object found in response:\n{raw[:400]}")
-        return None
-    json_str = raw[start:end+1]
-
     try:
-        data = json.loads(json_str)
-        _ppt_logger.debug("── RESEARCH JSON ──\n%s\n", json.dumps(data, indent=2))
-        if "slides" not in data or not isinstance(data["slides"], list):
-            return None
-        print(f"[ppt_research] Got {len(data['slides'])} slide topics.")
-        return data
-    except json.JSONDecodeError:
-        # Last resort: try to fix truncated JSON by closing open arrays/objects
-        try:
-            # Count unclosed brackets
-            open_braces   = json_str.count("{") - json_str.count("}")
-            open_brackets  = json_str.count("[") - json_str.count("]")
-            # Trim to last complete slide entry
-            last_complete = json_str.rfind("},")
-            if last_complete > 0:
-                trimmed = json_str[:last_complete+1]
-                trimmed += "]}" + ("}" * max(0, open_braces - 2))
-                data = json.loads(trimmed)
-                if "slides" in data and isinstance(data["slides"], list) and data["slides"]:
-                    print(f"[ppt_research] Recovered {len(data['slides'])} slides from truncated JSON.")
-                    return data
-        except Exception:
-            pass
-        print(f"[ppt_research] JSON parse error. Raw snippet:\n{json_str[:400]}")
+        response = agent.invoke({"messages": [{"role": "user", "content": task}]})
+    except Exception as e:
+        # Local tool-calling models occasionally emit malformed/truncated
+        # arguments for a tool call (e.g. Ollama's "unexpected end of JSON
+        # input" for web_search). That's a transport-level failure, not a
+        # content problem — fail soft here so the caller's outline fallback
+        # can take over instead of crashing the whole graph.
+        print(f"[ppt_research] Agent invocation failed: {e}")
+        _ppt_logger.debug("── RESEARCH INVOKE ERROR ──\n%s\n", e)
         return None
 
+    raw_msg = response["messages"][-1]
+    raw     = raw_msg.content if hasattr(raw_msg, "content") else str(raw_msg)
+
+    data = _extract_json(raw)
+    _ppt_logger.debug("── RESEARCH JSON ──\n%s\n", json.dumps(data, indent=2) if data else raw[:400])
+
+    if not data or "slides" not in data or not isinstance(data["slides"], list) or not data["slides"]:
+        print(f"[ppt_research] No usable JSON in response:\n{raw[:400]}")
+        return None
+
+    print(f"[ppt_research] Got {len(data['slides'])} slide topics.")
+    return data
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# AGENT 2.5 — Content Writer  (plain llm.invoke, no tools, ~4096 token context)
+# AGENT 3 — Design  (create_agent, no tools, ~32768 token context)
+#
+# Combines what used to be two separate agents (content writing + XML
+# layout) into one call: the model rewrites facts into bullet copy AND
+# picks/adapts a layout per slide, outputting JSON that matches
+# ppt_renderer.render_pptx's native schema directly.
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _build_content_prompt(research: dict) -> str:
-    today = datetime.now().strftime("%B %d, %Y")
-    return f"""You are a presentation content writer. Today is {today}.
-
-You receive a research brief with slide topics and raw facts.
-Your job is to rewrite each fact into a clear, punchy bullet point
-(max 15 words each) and generate a clean presentation title.
-
-INPUT:
-{json.dumps(research, indent=2)}
-
-OUTPUT: Return ONLY a JSON object in this exact format — no prose, no fences:
-{{"presentation_title": "Compelling title (5-8 words)","slides": [{{"title": "Slide heading","bullets": ["Bullet point one, specific and clear","Bullet point two with a key fact or number","Bullet point three concise takeaway"],"image_query": "3-6 word image query"}}]}}
-
-RULES:
-- Keep each bullet under 15 words
-- Make bullets specific — include numbers, names, dates from the facts
-- presentation_title should be descriptive and compelling, NOT the raw task string
-- Preserve the image_query from research if it is good, improve it if vague
-- Keep the same number of slides as the input
-- Output ONLY the JSON object, nothing else
-"""
-
-
-def _run_content_agent(research: dict) -> dict:
-    """Rewrites raw facts into clean bullet copy. Returns enriched research dict."""
-    llm = ChatOllama(model="granite4.1:8b", num_ctx=4096)
-    response = llm.invoke([
-        {"role": "user", "content": _build_content_prompt(research)},
-    ])
-    raw = str(response.content).strip()
-    _ppt_logger.debug("── CONTENT RAW ──\n%s\n", raw)
-
-    # Strip markdown fences
-    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
-
-    start = raw.find("{")
-    end   = raw.rfind("}")
-    if start == -1 or end == -1:
-        print("[ppt_content] No JSON found — using research as-is.")
-        return dict(research)
-
-    try:
-        data = json.loads(raw[start:end+1])
-        if "slides" not in data or not data["slides"]:
-            return research
-
-        # Merge back into research dict, preserving palette
-        enriched = {
-            "presentation_title": data.get("presentation_title") or research.get("presentation_title"),
-            "palette":            research.get("palette", "Technology"),
-            "slides": []
-        }
-        for slide in data["slides"]:
-            enriched["slides"].append({
-                "title":       slide.get("title", ""),
-                # Design agent expects "facts" key — populate with polished bullets
-                "facts":       slide.get("bullets") or slide.get("facts", []),
-                "image_query": slide.get("image_query", ""),
-            })
-
-        print(f"[ppt_content] Enriched {len(enriched['slides'])} slides. Title: \"{enriched['presentation_title']}\"")
-        return enriched
-
-    except json.JSONDecodeError as e:
-        print(f"[ppt_content] JSON parse error: {e} — using research as-is.")
-        return dict(research)
-
-# ═════════════════════════════════════════════════════════════════════════════
-# AGENT 3 — Design  (create_agent, no tools, ~16384 token context)
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Color palettes — injected selectively based on research agent's choice
 _PALETTES = {
     "Technology":    "bg=#0A0A1A  primary=#00BCD4  secondary=#7C4DFF  text=#E0F7FA  accent=#FF4081",
     "Professional":  "bg=#0D1B2A  primary=#2E86AB  secondary=#A23B72  text=#E8F4FD  accent=#F18F01",
@@ -285,40 +239,51 @@ _PALETTES = {
 
 _FORMAT_RULES = _load_format_rules()
 
+
 def _build_design_prompt(research: dict) -> str:
     palette_name = research.get("palette", "Technology")
     palette      = _PALETTES.get(palette_name, _PALETTES["Technology"])
+    today        = datetime.now().strftime("%B %d, %Y")
 
-    return f"""You are a PowerPoint slide designer. You receive research data and
-produce presentation XML. You do NOT search the web — all facts are provided.
+    return f"""You are a presentation writer AND designer. Today is {today}.
+You receive research data (raw facts per slide topic) and must produce a
+complete, ready-to-render presentation as a single JSON object. You do NOT
+search the web — all facts are provided below.
 
 PALETTE ({palette_name}): {palette}
-Use these colors for bg, primary/secondary stripes, text, and accent elements.
-The bg value is the slide background color. primary/secondary/accent are for rects.
-text color is for bullet text and body text.
+Wherever a layout pattern below refers to "primary" / "secondary" / "accent"
+/ "text", substitute the matching hex value from the palette above. The
+palette's bg value is a sensible default slide background, but you may vary
+background color slide to slide as long as text stays readable against it.
 
 RESEARCH DATA:
 {json.dumps(research, indent=2)}
 
+If the data above includes a "_user_feedback" field, treat it as revision
+instructions from the user and prioritize addressing it.
+
 YOUR JOB:
-Turn the research data into a complete presentation using the format below.
-- First slide: title slide using presentation_title
-- Middle slides: one slide per entry in the slides array
-  - Use facts as bullet points
-  - Add image element on slides that have an image_query (use text-left/image-right layout)
-  - Vary layouts: don't make every slide look identical
-- Last slide: closing slide
+1. Rewrite each slide's raw facts into clear, punchy bullets (max ~15 words
+   each) — specific, keeping the numbers/names/dates from the facts.
+2. Write a compelling presentation_title (5-8 words) — not the raw task text.
+3. For each slide, choose whichever layout best fits what that slide is
+   saying. Use the pattern library in the format rules below as a starting
+   menu — adapt, combine, or invent new arrangements whenever that serves
+   the content better. Vary layouts across the deck; don't repeat the same
+   one back-to-back unless the content genuinely calls for it.
+4. First slide: title. Last slide: closing. Middle slides: one per research
+   entry — include an image element only where it earns its place.
 
 {_FORMAT_RULES}
 
-Output ONLY the <presentation>…</presentation> block and a <title>…</title> tag before it.
-No prose, no explanation.
+Output ONLY the JSON object described in "Output schema" above — no prose,
+no markdown fences, no explanation. Start with {{ and end with }}.
 """
 
 
-def _run_design_agent(research: dict) -> str | None:
-    """Takes research dict, returns raw XML string or None."""
-    llm   = ChatOllama(model="granite4.1:8b", num_ctx=16384)
+def _run_design_agent(research: dict) -> dict | None:
+    """Takes research dict, returns the design JSON dict, or None."""
+    llm   = ChatOllama(model=MODEL, num_ctx=NUM_CTX * 2)
     agent = create_agent(
         model=llm,
         tools=[],   # no tools — design only
@@ -327,123 +292,101 @@ def _run_design_agent(research: dict) -> str | None:
 
     prompt = (
         f"Create the presentation for: {research.get('presentation_title', 'the topic')}. "
-        "Output the <title> tag then the full <presentation> XML block."
+        "Output the JSON object now."
     )
-    response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
-    raw_msg  = response["messages"][-1]
-    raw      = raw_msg.content if hasattr(raw_msg, "content") else str(raw_msg)
+    try:
+        response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+    except Exception as e:
+        print(f"[ppt_design] Agent invocation failed: {e}")
+        _ppt_logger.debug("── DESIGN INVOKE ERROR ──\n%s\n", e)
+        return None
 
-    raw = re.sub(
-    r"items='([^']*)'",
-    lambda m: "items='" + m.group(1).replace("'", "\\'") + "'",
-    raw
-)
+    raw_msg = response["messages"][-1]
+    raw     = raw_msg.content if hasattr(raw_msg, "content") else str(raw_msg)
 
-    _ppt_logger.debug("── DESIGN XML (%d chars) ──\n%s\n", len(raw), raw)
+    _ppt_logger.debug("── DESIGN RAW (%d chars) ──\n%s\n", len(raw), raw)
 
-    if "<presentation>" in raw:
-        print(f"[ppt_design] Got presentation XML ({len(raw)} chars).")
-        return raw
+    data = _extract_json(raw)
+    if data and isinstance(data.get("slides"), list) and data["slides"]:
+        print(f"[ppt_design] Got design JSON ({len(data['slides'])} slides).")
+        return data
 
-    print(f"[ppt_design] No <presentation> tag in output:\n{raw[:300]}")
+    print(f"[ppt_design] No valid JSON in output:\n{raw[:300]}")
     return None
 
+
 # ═════════════════════════════════════════════════════════════════════════════
-# XML PARSERS (unchanged from original ppt_agent_node.py)
+# Sanitizer — fills in safe defaults / coerces types so render_pptx never
+# sees a malformed element, without caring at all what layout was chosen.
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _attr(tag_str: str, name: str, default: str = "") -> str:
-    m = re.search(
-        rf'{name}\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s/>]+))',
-        tag_str
-    )
+_DIM_DEFAULTS = {"l": 0.0, "t": 0.0, "w": 6.0, "h": 5.0}
+_ELEMENT_TYPES = {"rect", "text", "bullets", "image"}
 
-    if not m:
-        return default
 
-    for g in m.groups():
-        if g is not None:
-            return g
+def _clean_dims(el: dict, clean: dict) -> None:
+    for dim in ("l", "t", "w", "h"):
+        try:
+            clean[dim] = float(el.get(dim, _DIM_DEFAULTS[dim]))
+        except (TypeError, ValueError):
+            clean[dim] = _DIM_DEFAULTS[dim]
 
-    return default
 
-def parse_presentation(raw: str) -> list[dict]:
-    pres_m = re.search(r"<presentation>(.*?)</presentation>", raw, re.DOTALL)
-    if not pres_m:
-        return []
+def sanitize_slides(data: dict) -> list[dict]:
+    """Converts the design agent's JSON into the exact list[dict] shape
+    render_pptx expects, filling defaults for anything missing/malformed."""
+    slides_out = []
+    for slide in data.get("slides", []) or []:
+        if not isinstance(slide, dict):
+            continue
+        bg = slide.get("bg") or "#1C1C1C"
+        elements_out = []
 
-    slides_data = []
-    slide_blocks = re.split(r"<slide\b", pres_m.group(1))[1:]
-
-    for block in slide_blocks:
-        bg_m = re.search(r'bg\s*=\s*"([^"]*)"', block)
-        bg   = bg_m.group(1) if bg_m else "#1C1C1C"
-        body = block.split("</slide>")[0]
-        elements = []
-
-        for el_m in re.finditer(r"<element\b(.*?)(?:/>|>.*?</element>)", body, re.DOTALL):
-            tag     = el_m.group(1)
-            el_type = _attr(tag, "type")
-            if not el_type:
+        for el in slide.get("elements", []) or []:
+            if not isinstance(el, dict):
                 continue
-            el: dict = {"type": el_type}
+            el_type = el.get("type")
+            if el_type not in _ELEMENT_TYPES:
+                continue
 
-            # Dimension defaults: h is the most commonly omitted by the LLM
-            _DIM_DEFAULTS = {"l": 0.0, "t": 0.0, "w": 6.0, "h": 5.0}
-            for dim in ("l", "t", "w", "h"):
-                v = _attr(tag, dim)
-                if v:
-                    try:
-                        el[dim] = float(v)
-                    except ValueError:
-                        el[dim] = _DIM_DEFAULTS[dim]
-                else:
-                    el[dim] = _DIM_DEFAULTS[dim]  # always set — never leave missing
+            clean: dict = {"type": el_type}
+            _clean_dims(el, clean)
 
             if el_type == "rect":
-                el["color"] = _attr(tag, "color", "#888888")
-                bc = _attr(tag, "border_color")
-                if bc:
-                    el["border_color"] = bc
+                clean["color"] = el.get("color", "#888888")
+                if el.get("border_color"):
+                    clean["border_color"] = el["border_color"]
 
             elif el_type == "text":
-                el["text"]   = _attr(tag, "text").replace("&amp;", "&")
-                el["size"]   = float(_attr(tag, "size", "18"))
-                el["bold"]   = _attr(tag, "bold", "false").lower() == "true"
-                el["italic"] = _attr(tag, "italic", "false").lower() == "true"
-                el["color"]  = _attr(tag, "color", "#FFFFFF")
-                el["align"]  = _attr(tag, "align", "left")
-                el["font"]   = _attr(tag, "font", "Calibri")
+                clean["text"]   = str(el.get("text", ""))
+                clean["size"]   = float(el.get("size") or 18)
+                clean["bold"]   = bool(el.get("bold", False))
+                clean["italic"] = bool(el.get("italic", False))
+                clean["color"]  = el.get("color", "#FFFFFF")
+                clean["align"]  = el.get("align", "left")
+                clean["font"]   = el.get("font", "Calibri")
 
             elif el_type == "bullets":
-                raw_items = _attr(tag, "items", "[]").replace("&amp;", "&")
-                try:
-                    items = json.loads(raw_items)
-                except Exception:
-                    inner = raw_items.strip().strip("[]")
-                    items = [i.strip().strip('"').strip("'")
-                             for i in inner.split('","') if i.strip()]
-                el["items"]        = items
-                el["size"]         = float(_attr(tag, "size", "16"))
-                el["bold"]         = _attr(tag, "bold", "false").lower() == "true"
-                el["italic"]       = _attr(tag, "italic", "false").lower() == "true"
-                el["color"]        = _attr(tag, "color", "#FFFFFF")
-                el["font"]         = _attr(tag, "font", "Calibri")
-                el["marker"]       = _attr(tag, "marker", "▸  ")
-                el["space_before"] = float(_attr(tag, "space_before", "7"))
+                items = el.get("items", [])
+                if not isinstance(items, list):
+                    items = [str(items)] if items else []
+                clean["items"]        = [str(i) for i in items]
+                clean["size"]         = float(el.get("size") or 16)
+                clean["bold"]         = bool(el.get("bold", False))
+                clean["italic"]       = bool(el.get("italic", False))
+                clean["color"]        = el.get("color", "#FFFFFF")
+                clean["font"]         = el.get("font", "Calibri")
+                clean["marker"]       = el.get("marker", "▸  ")
+                clean["space_before"] = float(el.get("space_before") or 7)
 
             elif el_type == "image":
-                el["image_query"] = _attr(tag, "image_query", "abstract background")
+                clean["image_query"] = el.get("image_query", "abstract background")
 
-            elements.append(el)
-        slides_data.append({"bg": bg, "elements": elements})
+            elements_out.append(clean)
 
-    return slides_data
+        slides_out.append({"bg": bg, "elements": elements_out})
 
-
-def extract_title(raw: str) -> str | None:
-    m = re.search(r"<title>(.*?)</title>", raw, re.DOTALL)
-    return m.group(1).strip() if m else None
+    return slides_out
 
 
 def _outline_to_research(task: str, outline_text: str) -> dict:
@@ -505,38 +448,48 @@ def _outline_to_research(task: str, outline_text: str) -> dict:
 
 def _run_design_and_render(task: str, research: dict) -> Command:
     """
-    Shared helper: content-write → design → render → index.
-    Called from both the first-pass path (no review) and the resume path (after review).
-    Returns a Command going to supervisor with ppt_result set.
+    Shared helper: design (content + layout in one call) → render → index.
+    Called from both the first-pass path (no review) and the resume path
+    (after review). Returns a Command going to supervisor with ppt_result set.
     """
-    # ── Content Writing ───────────────────────────────────────────────────────
-    print("[ppt_agent] Step 2.5: Content writing…")
-    research = _run_content_agent(research) or research
+    print(f"[ppt_agent] Step 3: Design ({len(research.get('slides', []))} slide topics)…")
+    design_data = _run_design_agent(research)
 
-    # ── Design ────────────────────────────────────────────────────────────────
-    print(f"[ppt_agent] Step 3: Design ({len(research['slides'])} slides)…")
-    raw_xml = _run_design_agent(research)
-
-    if not raw_xml:
-        print("[ppt_agent] Design returned no XML, retrying…")
-        llm   = ChatOllama(model="granite4.1:8b", num_ctx=16384)
+    if not design_data:
+        print("[ppt_agent] Design returned no JSON, retrying…")
+        llm   = ChatOllama(model=MODEL, num_ctx=NUM_CTX * 2)
         agent = create_agent(
             model=llm,
             tools=[],
             system_prompt=_build_design_prompt(research),
         )
-        retry_prompt = (
-            "Output the presentation NOW. Start with <title> then <presentation>. "
-            "No prose. Just the XML tags."
-        )
-        resp    = agent.invoke({"messages": [{"role": "user", "content": retry_prompt}]})
-        raw_msg = resp["messages"][-1]
-        raw_xml = raw_msg.content if hasattr(raw_msg, "content") else str(raw_msg)
+        retry_prompt = "Output the presentation JSON now. Start with { and end with }. No prose."
+        try:
+            resp    = agent.invoke({"messages": [{"role": "user", "content": retry_prompt}]})
+            raw_msg = resp["messages"][-1]
+            raw     = raw_msg.content if hasattr(raw_msg, "content") else str(raw_msg)
+            design_data = _extract_json(raw)
+        except Exception as e:
+            print(f"[ppt_design] Retry invocation failed: {e}")
+            _ppt_logger.debug("── DESIGN RETRY INVOKE ERROR ──\n%s\n", e)
+            design_data = None
 
-    slides_data = parse_presentation(raw_xml or "")
+    if not design_data or not design_data.get("slides"):
+        err = "ERROR: Design agent produced no slides."
+        return Command(
+            update={
+                "ppt_result": err,
+                "ppt_research_data": None, "ppt_awaiting_approval": False,
+                "ppt_research_feedback": None, "ppt_clarification_round": 0,
+                "next": "supervisor",
+            },
+            goto="supervisor",
+        )
+
+    slides_data = sanitize_slides(design_data)
 
     if not slides_data:
-        err = f"ERROR: Design agent produced no slides.\nLast output:\n{(raw_xml or '')[:400]}"
+        err = "ERROR: Design JSON had no usable slides after sanitizing."
         return Command(
             update={
                 "ppt_result": err,
@@ -550,7 +503,7 @@ def _run_design_and_render(task: str, research: dict) -> Command:
     print(f"[ppt_agent] Parsed {len(slides_data)} slides.")
 
     # ── Render ────────────────────────────────────────────────────────────────
-    raw_title = extract_title(raw_xml or "") or research.get("presentation_title") or task
+    raw_title = design_data.get("presentation_title") or research.get("presentation_title") or task
     slug      = re.sub(r"[^a-z0-9]+", "_", raw_title.lower())[:50].strip("_")
     filename  = f"{slug}.pptx"
     abs_path  = os.path.abspath(os.path.join(WATCHED_FOLDER, filename))
@@ -645,7 +598,7 @@ def ppt_agent_node(state: dict[str, Any]) -> Command:
         else:
             print(f"[ppt_agent] Applying user feedback: {feedback[:80]}")
             research = dict(research)
-            research["_user_feedback"] = feedback   # content agent will see this
+            research["_user_feedback"] = feedback   # design agent will see this
 
         return _run_design_and_render(task, research)
 
@@ -695,10 +648,10 @@ def ppt_agent_node(state: dict[str, Any]) -> Command:
             research = _outline_to_research(task, str(prior_outline))
 
         if not research or len(research.get("slides", [])) < 3:
-            # Prior outline parse failed or no usable outline — ask the LLM to
-            # synthesise a research dict directly from the task description.
-            print("[ppt_agent] Generating synthetic research from task description…")
-
+            # Prior outline parse failed or no usable outline — fall back to a
+            # minimal single-slide research dict so the pipeline can still run.
+            print("[ppt_agent] No usable research — falling back to task-only outline.")
+            research = _outline_to_research(task, task)
 
     # ── Pause: stash research, set flag, return to supervisor ─────────────────
     print("[ppt_agent] Research done — handing to supervisor for user review.")

@@ -27,6 +27,7 @@ from langchain_ollama import ChatOllama
 from langchain.agents import create_agent
 from langgraph.types import Command
 from datetime import datetime
+from config import MODEL, NUM_CTX
 
 from tools import web_search, fetch_page   # fetch_page is the new page-reader tool
 
@@ -67,7 +68,7 @@ _TOOLS = [web_search, fetch_page]
 
 def web_search_agent_node(state: dict[str, Any]) -> Command:
     task    = state.get("web_search_task", "")
-    llm     = ChatOllama(model="granite4.1:8b", num_ctx=8192)
+    llm     = ChatOllama(model=MODEL, num_ctx=NUM_CTX)
     agent   = create_agent(model=llm, tools=_TOOLS, system_prompt=_PROMPT)
 
     history = list(state.get("messages", []))

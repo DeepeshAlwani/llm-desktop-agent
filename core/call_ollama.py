@@ -12,7 +12,7 @@ The graph (agents/graph.py) routes automatically:
   - Presentation requests  → ppt_agent_node
   - Everything else        → system_agent_node
 """
-
+import os
 from genericpath import exists
 
 from rich.console import Console
@@ -387,9 +387,12 @@ memory.init_db()
 init_file_db()
 _file_observer = Observer()
 _file_observer.schedule(AgentFileHandler(), WATCHED_FOLDER, recursive=True)
+
+
 _file_observer.start()
 console.print(f"[dim]📁 Watching workspace: {WATCHED_FOLDER}[/dim]\n")
-
+print("WATCHING:", WATCHED_FOLDER)
+print("EXISTS:", os.path.exists(WATCHED_FOLDER))
 memory.start_session(SESSION_ID)
 conversation_history = memory.get_recent_context(session_id=SESSION_ID, n=10)
 

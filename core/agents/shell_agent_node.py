@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from config import MODEL, NUM_CTX
 from langchain_ollama import ChatOllama
 from langchain.agents import create_agent
 from langgraph.types import Command
@@ -68,7 +69,7 @@ _TOOLS = [query_system, run_system_command, show_system_monitor]
 
 def shell_agent_node(state: dict[str, Any]) -> Command:
     task    = state.get("shell_task", "")
-    llm     = ChatOllama(model="granite4.1:8b", num_ctx=8192)
+    llm     = ChatOllama(model=MODEL, num_ctx=NUM_CTX)
     agent   = create_agent(model=llm, tools=_TOOLS, system_prompt=_PROMPT)
 
     history = list(state.get("messages", []))
